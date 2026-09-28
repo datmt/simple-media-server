@@ -20,7 +20,7 @@ for target in "${TARGETS[@]}"; do
 
   echo "building $target..."
   CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
-    go build -trimpath -ldflags="-s -w" -o "$DIST/$bin" .
+    go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o "$DIST/$bin" .
 
   ( cd "$DIST" && tar -czf "${name}.tar.gz" "$bin" && rm "$bin" )
 done

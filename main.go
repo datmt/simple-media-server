@@ -30,12 +30,17 @@ type cred struct {
 
 var unsafeName = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
+// version is set at build time via -ldflags "-X main.version=vX.Y.Z"
+// (build.sh / release.sh do this); "dev" for a plain `go build`.
+var version = "dev"
+
 const rootUsage = `mediad - self-contained media streaming & ingestion engine
 
 Usage:
   mediad [flags]                     run the server (default command)
   mediad adduser <user> <pass> [creds-path]
                                       hash a password and add/update a user in creds.json
+  mediad version                     print the version
   mediad help                        show this help
 
 Flags for "mediad [flags]":
@@ -44,6 +49,10 @@ Flags for "mediad [flags]":
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "adduser" {
 		adduser(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && (os.Args[1] == "version" || os.Args[1] == "-v" || os.Args[1] == "--version") {
+		fmt.Println(version)
 		return
 	}
 

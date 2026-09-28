@@ -4,8 +4,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 OUT="${1:-./mediad}"
+VERSION="${VERSION:-$(git describe --tags --always 2>/dev/null || echo dev)}"
 
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$OUT" .
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o "$OUT" .
 
 size=$(stat -c%s "$OUT" 2>/dev/null || stat -f%z "$OUT")
 echo "built $OUT ($((size / 1024 / 1024)) MB)"
