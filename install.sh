@@ -47,5 +47,4 @@ else
   sudo mv "$tmp" "$dest"
 fi
 
-echo "installed $dest"
-"$dest" help | head -1
+echo "installed $dest ($("$dest" version))"
