@@ -26,7 +26,8 @@ latest=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
   | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
 
 if [ -x "$dest" ]; then
-  current=$("$dest" version 2>/dev/null || echo "")
+  # timeout: pre-`version` binaries ignore the arg and start the server
+  current=$(timeout 3 "$dest" version 2>/dev/null </dev/null || echo "")
   if [ -n "$latest" ] && [ "$current" = "$latest" ]; then
     echo "$dest already at $current, skipping"
     exit 0
