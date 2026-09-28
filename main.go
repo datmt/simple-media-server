@@ -91,6 +91,7 @@ func main() {
 	queue := make(chan int64, 100)
 	go worker(db, *servingDir, queue)
 	reconcile(db, queue)
+	adoptOrphans(db, *uploadDir, queue)
 
 	creds := loadCreds(*credsPath)
 
@@ -296,6 +297,52 @@ func streamHandler(servingDir string) http.Handler {
 		w.Header().Set("Accept-Ranges", "bytes")
 		fs.ServeHTTP(w, r)
 	})
+}
+
+// adoptOrphans finds files in uploadDir with no matching raw_path in the
+// db (e.g. dropped in manually, or left over from a crash before the DB
+// insert landed) and enqueues them as new pending videos. Startup only.
+func adoptOrphans(db *sql.DB, uploadDir string, queue chan<- int64) {
+	entries, err := os.ReadDir(uploadDir)
+	if err != nil {
+		log.Printf("adopt orphans: read %s: %v", uploadDir, err)
+		return
+	}
+
+	known := map[string]bool{}
+	rows, err := db.Query(`SELECT raw_path FROM videos`)
+	if err != nil {
+		log.Printf("adopt orphans: query: %v", err)
+		return
+	}
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			log.Printf("adopt orphans: scan: %v", err)
+			rows.Close()
+			return
+		}
+		known[p] = true
+	}
+	rows.Close()
+
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		path := filepath.Join(uploadDir, e.Name())
+		if known[path] {
+			continue
+		}
+		res, err := db.Exec(`INSERT INTO videos (filename, raw_path) VALUES (?, ?)`, e.Name(), path)
+		if err != nil {
+			log.Printf("adopt orphans: insert %s: %v", path, err)
+			continue
+		}
+		id, _ := res.LastInsertId()
+		log.Printf("adopted orphan file %s as video %d", path, id)
+		queue <- id
+	}
 }
 
 // reconcile re-enqueues any job left in pending/processing from a prior
