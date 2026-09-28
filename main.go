@@ -78,7 +78,7 @@ func main() {
 		}
 	}
 
-	db, err := sql.Open("sqlite", *dbPath)
+	db, err := sql.Open("sqlite", *dbPath+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
