@@ -21,13 +21,21 @@ case "$arch" in
 esac
 
 dest="${INSTALL_DIR}/${BIN_NAME}"
+log() { echo "[install] $*" >&2; }
+CURL="curl -fsSL --connect-timeout 10 --max-time 300"
+log "os=$os arch=$arch dest=$dest"
 
-latest=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+log "fetching latest release tag"
+latest=$($CURL "https://api.github.com/repos/${REPO}/releases/latest" \
   | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
 
+log "latest=${latest:-<none>}"
+
 if [ -x "$dest" ]; then
+  log "existing binary found, checking version"
   # timeout: pre-`version` binaries ignore the arg and start the server
   current=$(timeout 3 "$dest" version 2>/dev/null </dev/null || echo "")
+  log "current=${current:-<unknown>}"
   if [ -n "$latest" ] && [ "$current" = "$latest" ]; then
     echo "$dest already at $current, skipping"
     exit 0
@@ -39,12 +47,14 @@ tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
 
 echo "downloading $url"
-curl -fsSL "$url" -o "$tmp"
+$CURL "$url" -o "$tmp"
 chmod +x "$tmp"
 
 if [ -w "$INSTALL_DIR" ]; then
+  log "moving to $dest"
   mv "$tmp" "$dest"
 else
+  log "$INSTALL_DIR not writable, using sudo (may prompt for password)"
   sudo mv "$tmp" "$dest"
 fi
 
