@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>mediad</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;background:#111;color:#eee}
+  video{width:100%;max-height:60vh;background:#000}
+  table{width:100%;border-collapse:collapse;margin-top:1rem}
+  td,th{text-align:left;padding:.4rem;border-bottom:1px solid #333}
+  .pending,.processing{color:#e0a800}
+  .ready{color:#4caf50}
+  .failed{color:#e53935}
+  a{color:#66b3ff;cursor:pointer}
+  form{margin-top:1rem}
+</style>
+</head>
+<body>
+<h1>mediad</h1>
+<video id="player" controls></video>
+<form id="uploadForm">
+  <input type="file" id="fileInput" accept="video/*" required>
+  <button type="submit">Upload</button>
+</form>
+<table>
+  <thead><tr><th>ID</th><th>Filename</th><th>Status</th><th>Created</th><th></th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<script>
+const rowsEl = document.getElementById('rows');
+const video = document.getElementById('player');
+let hls;
+
+function play(id) {
+  const src = '/stream/' + id + '/playlist.m3u8';
+  if (hls) hls.destroy();
+  if (Hls.isSupported()) {
+    hls = new Hls();
+    hls.loadSource(src);
+    hls.attachMedia(video);
+  } else {
+    video.src = src;
+  }
+  video.play();
+}
+
+async function refresh() {
+  const res = await fetch('/api/videos');
+  const items = await res.json();
+  rowsEl.innerHTML = items.map(v => `
+    <tr>
+      <td>${v.id}</td>
+      <td>${v.filename}</td>
+      <td class="${v.status}">${v.status}</td>
+      <td>${v.created_at}</td>
+      <td>${v.status === 'ready' ? `<a onclick="play(${v.id})">play</a>` : ''}</td>
+    </tr>`).join('');
+}
+window.play = play;
+
+document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const file = document.getElementById('fileInput').files[0];
+  if (!file) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  await fetch('/api/upload', { method: 'POST', body: fd });
+  document.getElementById('fileInput').value = '';
+  refresh();
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
