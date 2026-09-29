@@ -69,6 +69,9 @@ func main() {
 	dbPath := flag.String("db-path", "./media.db", "path to the sqlite database file")
 	credsPath := flag.String("creds-path", "./creds.json", "path to the basic-auth credentials file")
 	port := flag.Int("port", 8080, "http listen port")
+	optHeight := flag.Int("optimize-height", 360, "optimized video height in px (never upscales)")
+	optCRF := flag.Int("optimize-crf", 28, "x264 quality, 18 (best) to 35 (smallest)")
+	optPreset := flag.String("optimize-preset", "ultrafast", "x264 speed preset (ultrafast, veryfast, medium, ...)")
 	scanEvery := flag.Duration("scan-interval", 5*time.Minute, "how often to rescan the library (0 disables)")
 
 	if len(os.Args) > 1 && os.Args[1] == "help" {
@@ -123,7 +126,7 @@ func main() {
 	}
 
 	queue := make(chan int64, 100)
-	go worker(db, *servingDir, queue)
+	go worker(db, *servingDir, encodeOpts{*optHeight, *optCRF, *optPreset}, queue)
 	lib := &library{db: db, root: *libDir, servingDir: *servingDir, wake: make(chan struct{}, 1)}
 	go lib.prober()
 	lib.scan(true)
@@ -648,13 +651,18 @@ func reconcile(db *sql.DB, queue chan<- int64) {
 	}
 }
 
-func worker(db *sql.DB, servingDir string, queue <-chan int64) {
+type encodeOpts struct {
+	height, crf int
+	preset      string
+}
+
+func worker(db *sql.DB, servingDir string, opts encodeOpts, queue <-chan int64) {
 	for id := range queue {
-		processOne(db, servingDir, id)
+		processOne(db, servingDir, opts, id)
 	}
 }
 
-func processOne(db *sql.DB, servingDir string, id int64) {
+func processOne(db *sql.DB, servingDir string, opts encodeOpts, id int64) {
 	var rawPath string
 	if err := db.QueryRow(`SELECT raw_path FROM videos WHERE id = ?`, id).Scan(&rawPath); err != nil {
 		log.Printf("job %d: lookup failed: %v", id, err)
@@ -674,8 +682,11 @@ func processOne(db *sql.DB, servingDir string, id int64) {
 	}
 
 	cmd := exec.Command("ffmpeg", "-y", "-i", rawPath,
-		"-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-		"-c:a", "aac", "-b:a", "128k",
+		"-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
+		"-vf", fmt.Sprintf("scale=-2:'min(%d,ih)'", opts.height),
+		"-c:v", "libx264", "-preset", opts.preset, "-crf", strconv.Itoa(opts.crf),
+		"-profile:v", "main", "-pix_fmt", "yuv420p",
+		"-c:a", "aac", "-b:a", "96k", "-ac", "2",
 		"-hls_time", "4",
 		"-hls_playlist_type", "vod",
 		"-hls_segment_filename", filepath.Join(outDir, "chunk_%03d.ts"),

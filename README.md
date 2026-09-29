@@ -39,6 +39,9 @@ Flags (`--library-dir` is required, the rest optional):
 | `--creds-path` | `./creds.json` | basic-auth credentials |
 | `--port` | `8080` | HTTP listen port |
 | `--scan-interval` | `5m` | periodic library rescan (`0` disables); overlapping scans are skipped |
+| `--optimize-height` | `360` | optimized video height in px, never upscaled |
+| `--optimize-crf` | `28` | x264 quality, 18 (best) to 35 (smallest) |
+| `--optimize-preset` | `ultrafast` | x264 speed preset; slower gives smaller files |
 
 `ffprobe` (bundled with `ffmpeg`) is used in the background to read duration,
 resolution and codecs.

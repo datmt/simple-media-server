@@ -29,7 +29,7 @@ transcode, upload, embedded UI, basic auth. Only runtime dependency is `ffmpeg` 
   - `GET /stream/` -> `streamHandler` (serves the HLS dir)
   - `GET /{$}` -> `indexHandler`
 - `basicAuth` wraps the mux. `loadCreds` reads `creds.json` (bcrypt hashes); no creds means auth is disabled with a warning.
-- Job pipeline: `optimizeHandler` marks selected rows `pending`, pushes the id to a buffered channel (`queue`, cap 100), and `worker` runs `processOne` serially. `processOne` runs `pending -> processing -> ready|failed` via `ffmpeg` (libx264/aac, 4s HLS segments) into `<serving-dir>/<id>/`.
+- Job pipeline: `optimizeHandler` marks selected rows `pending`, pushes the id to a buffered channel (`queue`, cap 100), and `worker` runs `processOne` serially. `processOne` runs `pending -> processing -> ready|failed` via `ffmpeg` (libx264/aac, mobile-first: 360p, crf 28, ultrafast, tunable via `--optimize-*` flags; 4s HLS segments) into `<serving-dir>/<id>/`.
 - `reconcile`: re-enqueues rows left `pending`/`processing` by a killed run.
 - `library.scan`: walks `--library-dir` recursively (skips serving dir), upserts by `raw_path`, resets `ready|failed` -> `new` if size/mtime changed, deletes rows (and HLS dir) for vanished files. Never enqueues. `scan(false)` (ticker) uses `TryLock` and skips if a scan is running; `scan(true)` (startup, `POST /api/scan`) waits. Skips entirely if the library dir is unreadable, so an unmounted drive doesn't wipe the DB.
 - `library.prober`: one goroutine, woken by `upsert`, runs `ffprobe` on rows with `probed=0` and stores duration/width/height/vcodec/acodec. `upsert` resets `probed` when size/mtime change. `browserNative` is a container+codec guess behind the UI's "optimize to play" hint.
