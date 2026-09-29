@@ -34,7 +34,7 @@
   #fileInput{display:none}
 
   .list{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
-  .row{display:grid;grid-template-columns:32px minmax(0,1fr) 130px 70px 70px 80px 110px;gap:.75rem;align-items:center;
+  .row{display:grid;grid-template-columns:32px 84px minmax(0,1fr) 130px 70px 70px 80px 110px;gap:.75rem;align-items:center;
     padding:.6rem .9rem;border-bottom:1px solid var(--line)}
   .row:last-child{border-bottom:0}
   .row.head{color:var(--muted);font-size:.8em;text-transform:uppercase;letter-spacing:.05em;padding-top:.5rem;padding-bottom:.5rem}
@@ -44,6 +44,8 @@
   .title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .path{color:var(--muted);font-size:.85em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .muted{color:var(--muted)}
+  .thumb{width:84px;height:47px;object-fit:cover;border-radius:4px;background:#0e1015}
+  .mmeta{display:none;color:var(--muted);font-size:.8em}
 
   .pill{display:inline-flex;align-items:center;gap:.4rem;font-size:.85em}
   .pill::before{content:"";width:8px;height:8px;border-radius:50%;background:currentColor}
@@ -61,8 +63,10 @@
   #toast.on{opacity:1}
 
   @media(max-width:700px){
-    .row{grid-template-columns:28px minmax(0,1fr) 110px}
-    .row>:nth-child(n+4){display:none}
+    .row{grid-template-columns:28px 64px minmax(0,1fr) 110px}
+    .row>:nth-child(n+5){display:none}
+    .row .thumb{width:64px;height:36px}
+    .mmeta{display:block}
   }
   .warn{color:var(--busy);font-size:.8em;margin-left:.4rem}
 </style>
@@ -105,7 +109,7 @@
   <div class="list">
     <div class="row head">
       <input type="checkbox" id="all" aria-label="Select all">
-      <span>Title</span><span>Status</span><span>Length</span><span>Res</span><span>Size</span><span>Modified</span>
+      <span></span><span>Title</span><span>Status</span><span>Length</span><span>Res</span><span>Size</span><span>Modified</span>
     </div>
     <div id="rows"></div>
     <div id="empty" hidden>No videos match.</div>
@@ -150,9 +154,10 @@ function play(v) {
   } else {
     video.src = ready ? `/stream/${v.id}/playlist.m3u8` : `/api/raw/${v.id}`;
   }
+  video.poster = `/stream/thumbs/${v.id}.jpg?v=${v.mtime}`;
   video.play().catch(() => toast('Cannot play this file in the browser — optimize it first'));
   $('nowTitle').textContent = v.title;
-  $('nowKind').textContent = ready ? 'HLS' : 'Original file';
+  $('nowKind').textContent = `${ready ? 'HLS' : 'Original file'} · ${dur(v.duration)} · ${size(v.size)}`;
   $('stage').classList.add('on');
   $('stage').scrollIntoView({behavior: 'smooth', block: 'nearest'});
   render();
@@ -162,7 +167,8 @@ function render() {
   $('rows').innerHTML = items.map(v => `
     <div class="row ${v.id === playing ? 'active' : ''}" data-id="${v.id}">
       <input type="checkbox" ${selected.has(v.id) ? 'checked' : ''} aria-label="Select">
-      <div style="min-width:0"><div class="title">${esc(v.title)}${!v.native && v.status !== 'ready' ? `<span class="warn" title="${esc(v.vcodec)} may not play in browsers">optimize to play</span>` : ''}</div><div class="path">${esc(v.path)}</div></div>
+      <img class="thumb" loading="lazy" src="/stream/thumbs/${v.id}.jpg?v=${v.mtime}" alt="" onerror="this.style.visibility='hidden'">
+      <div style="min-width:0"><div class="title">${esc(v.title)}${!v.native && v.status !== 'ready' ? `<span class="warn" title="${esc(v.vcodec)} may not play in browsers">optimize to play</span>` : ''}</div><div class="path">${esc(v.path)}</div><div class="mmeta">${dur(v.duration)} · ${size(v.size)}</div></div>
       <span class="pill ${v.status}">${label[v.status] || v.status}</span>
       <span class="muted">${dur(v.duration)}</span>
       <span class="muted">${v.height ? v.height + 'p' : '—'}</span>

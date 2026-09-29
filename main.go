@@ -355,6 +355,7 @@ func (l *library) scan(block bool) {
 	for _, id := range gone {
 		l.db.Exec(`DELETE FROM videos WHERE id = ?`, id)
 		os.RemoveAll(filepath.Join(l.servingDir, strconv.FormatInt(id, 10)))
+		os.Remove(l.thumbPath(id))
 	}
 	log.Printf("scan: %d videos, %d removed", len(seen), len(gone))
 }
@@ -510,6 +511,7 @@ func probe(path string) meta {
 // prober fills in metadata for rows with probed=0, one file at a time, so
 // scans stay fast. A file that changes mid-probe is left for the next pass.
 func (l *library) prober() {
+	l.thumbMissing()
 	for range l.wake {
 		for {
 			var id, size, mtime int64
@@ -519,6 +521,7 @@ func (l *library) prober() {
 				break
 			}
 			m := probe(path)
+			l.thumb(id, path, m)
 			if _, err := l.db.Exec(`UPDATE videos SET duration=?, width=?, height=?, vcodec=?, acodec=?, probed=1
 				WHERE id=? AND size=? AND mtime=?`,
 				m.Duration, m.Width, m.Height, m.VCodec, m.ACodec, id, size, mtime); err != nil {
@@ -526,6 +529,49 @@ func (l *library) prober() {
 				break
 			}
 		}
+	}
+}
+
+func (l *library) thumbPath(id int64) string {
+	return filepath.Join(l.servingDir, "thumbs", strconv.FormatInt(id, 10)+".jpg")
+}
+
+// thumb grabs one 160px-wide frame at 10% into the video, served at
+// /stream/thumbs/<id>.jpg. Failures just mean no thumbnail.
+func (l *library) thumb(id int64, path string, m meta) {
+	if m.VCodec == "" {
+		return
+	}
+	out := l.thumbPath(id)
+	os.MkdirAll(filepath.Dir(out), 0755)
+	if b, err := exec.Command("ffmpeg", "-y", "-loglevel", "error", "-ss", strconv.FormatFloat(m.Duration*0.1, 'f', 2, 64),
+		"-i", path, "-frames:v", "1", "-vf", "scale=160:-2", "-q:v", "5", out).CombinedOutput(); err != nil {
+		log.Printf("thumb %d: %v\n%s", id, err, b)
+	}
+}
+
+// thumbMissing backfills thumbnails for rows probed before thumbs existed.
+func (l *library) thumbMissing() {
+	rows, err := l.db.Query(`SELECT id, raw_path, duration, vcodec FROM videos WHERE probed = 1 AND vcodec != ''`)
+	if err != nil {
+		return
+	}
+	var todo []meta
+	var ids []int64
+	var paths []string
+	for rows.Next() {
+		var id int64
+		var p string
+		var m meta
+		if rows.Scan(&id, &p, &m.Duration, &m.VCodec) == nil {
+			if _, err := os.Stat(l.thumbPath(id)); err != nil {
+				todo, ids, paths = append(todo, m), append(ids, id), append(paths, p)
+			}
+		}
+	}
+	rows.Close()
+	for i := range ids {
+		l.thumb(ids[i], paths[i], todo[i])
 	}
 }
 
