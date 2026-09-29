@@ -1,6 +1,8 @@
 /mediad
 /dist/
-/uploads/
+/library/
 /stream/
 /media.db
 /creds.json
+/log
+/media.db*

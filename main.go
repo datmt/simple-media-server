@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -15,9 +16,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
+	"sync"
+	"time"
 
-	_ "modernc.org/sqlite"
 	"golang.org/x/crypto/bcrypt"
+	_ "modernc.org/sqlite"
 )
 
 //go:embed ui/index.html
@@ -60,11 +64,12 @@ func main() {
 		fmt.Fprint(os.Stderr, rootUsage)
 		flag.PrintDefaults()
 	}
-	uploadDir := flag.String("upload-dir", "./uploads", "destination for incoming raw video files")
+	libDir := flag.String("library-dir", "", "media library root, scanned recursively (required); uploads land in <library-dir>/uploads")
 	servingDir := flag.String("serving-dir", "./stream", "target directory for generated HLS assets")
 	dbPath := flag.String("db-path", "./media.db", "path to the sqlite database file")
 	credsPath := flag.String("creds-path", "./creds.json", "path to the basic-auth credentials file")
 	port := flag.Int("port", 8080, "http listen port")
+	scanEvery := flag.Duration("scan-interval", 5*time.Minute, "how often to rescan the library (0 disables)")
 
 	if len(os.Args) > 1 && os.Args[1] == "help" {
 		flag.Usage()
@@ -72,7 +77,10 @@ func main() {
 	}
 	flag.Parse()
 
-	for _, d := range []string{*uploadDir, *servingDir} {
+	if *libDir == "" {
+		log.Fatal("--library-dir is required")
+	}
+	for _, d := range []string{*libDir, *servingDir} {
 		if err := os.MkdirAll(d, 0755); err != nil {
 			log.Fatalf("mkdir %s: %v", d, err)
 		}
@@ -83,12 +91,29 @@ func main() {
 		log.Fatalf("open db: %v", err)
 	}
 	defer db.Close()
+	// Older schemas lack the probe columns: drop the table and its stale HLS output.
+	if _, err := db.Exec(`SELECT probed FROM videos LIMIT 0`); err != nil {
+		db.Exec(`DROP TABLE IF EXISTS videos`)
+		if ents, err := os.ReadDir(*servingDir); err == nil {
+			for _, e := range ents {
+				os.RemoveAll(filepath.Join(*servingDir, e.Name()))
+			}
+		}
+	}
 	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS videos (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			filename TEXT NOT NULL,
-			status TEXT CHECK(status IN ('pending', 'processing', 'ready', 'failed')) DEFAULT 'pending',
-			raw_path TEXT NOT NULL,
+			status TEXT CHECK(status IN ('new', 'pending', 'processing', 'ready', 'failed')) DEFAULT 'new',
+			raw_path TEXT NOT NULL UNIQUE,
+			size INTEGER NOT NULL DEFAULT 0,
+			mtime INTEGER NOT NULL DEFAULT 0,
+			probed INTEGER NOT NULL DEFAULT 0,
+			duration REAL NOT NULL DEFAULT 0,
+			width INTEGER NOT NULL DEFAULT 0,
+			height INTEGER NOT NULL DEFAULT 0,
+			vcodec TEXT NOT NULL DEFAULT '',
+			acodec TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);
@@ -99,13 +124,25 @@ func main() {
 
 	queue := make(chan int64, 100)
 	go worker(db, *servingDir, queue)
+	lib := &library{db: db, root: *libDir, servingDir: *servingDir, wake: make(chan struct{}, 1)}
+	go lib.prober()
+	lib.scan(true)
 	reconcile(db, queue)
-	adoptOrphans(db, *uploadDir, queue)
+	if *scanEvery > 0 {
+		go func() {
+			for range time.Tick(*scanEvery) {
+				lib.scan(false)
+			}
+		}()
+	}
 
 	creds := loadCreds(*credsPath)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/upload", uploadHandler(db, *uploadDir, queue))
+	mux.HandleFunc("POST /api/upload", lib.uploadHandler)
+	mux.HandleFunc("POST /api/scan", func(w http.ResponseWriter, r *http.Request) { lib.scan(true); w.WriteHeader(http.StatusNoContent) })
+	mux.HandleFunc("POST /api/optimize", optimizeHandler(db, queue))
+	mux.HandleFunc("GET /api/raw/{id}", rawHandler(db))
 	mux.HandleFunc("GET /api/videos", listHandler(db))
 	mux.Handle("GET /stream/", http.StripPrefix("/stream/", streamHandler(*servingDir)))
 	mux.HandleFunc("GET /{$}", indexHandler)
@@ -218,56 +255,327 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-func uploadHandler(db *sql.DB, uploadDir string, queue chan<- int64) http.HandlerFunc {
+var videoExts = map[string]bool{".mp4": true, ".mkv": true, ".webm": true, ".mov": true, ".avi": true, ".m4v": true}
+
+type library struct {
+	db         *sql.DB
+	root       string
+	servingDir string
+	mu         sync.Mutex    // one scan at a time
+	wake       chan struct{} // nudges the prober when rows need probing
+}
+
+// upsert records a file; a changed size/mtime resets ready/failed to new
+// and queues a re-probe.
+func (l *library) upsert(path string, info fs.FileInfo) error {
+	err := l.upsertRow(path, info)
+	select {
+	case l.wake <- struct{}{}:
+	default:
+	}
+	return err
+}
+
+func (l *library) upsertRow(path string, info fs.FileInfo) error {
+	rel, err := filepath.Rel(l.root, path)
+	if err != nil {
+		return err
+	}
+	_, err = l.db.Exec(`
+		INSERT INTO videos (filename, raw_path, size, mtime) VALUES (?, ?, ?, ?)
+		ON CONFLICT(raw_path) DO UPDATE SET
+			filename = excluded.filename,
+			status = CASE WHEN (size != excluded.size OR mtime != excluded.mtime)
+				AND status IN ('ready', 'failed') THEN 'new' ELSE status END,
+			probed = CASE WHEN size != excluded.size OR mtime != excluded.mtime THEN 0 ELSE probed END,
+			size = excluded.size, mtime = excluded.mtime`,
+		rel, path, info.Size(), info.ModTime().Unix())
+	return err
+}
+
+// scan walks the library, upserts every video, and drops rows whose file is gone.
+// block=false (the periodic scan) skips if another scan is still running;
+// block=true (startup, manual) waits for it.
+func (l *library) scan(block bool) {
+	if block {
+		l.mu.Lock()
+	} else if !l.mu.TryLock() {
+		log.Println("scan: previous scan still running, skipping")
+		return
+	}
+	defer l.mu.Unlock()
+	// Unmounted/missing library must not look like "every file was deleted".
+	if _, err := os.ReadDir(l.root); err != nil {
+		log.Printf("scan: library unreadable, skipping: %v", err)
+		return
+	}
+	seen := map[string]bool{}
+	filepath.WalkDir(l.root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if sameDir(path, l.servingDir) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !videoExts[strings.ToLower(filepath.Ext(path))] {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if err := l.upsert(path, info); err != nil {
+			log.Printf("scan: upsert %s: %v", path, err)
+			return nil
+		}
+		seen[path] = true
+		return nil
+	})
+
+	rows, err := l.db.Query(`SELECT id, raw_path FROM videos`)
+	if err != nil {
+		log.Printf("scan: query: %v", err)
+		return
+	}
+	var gone []int64
+	for rows.Next() {
+		var id int64
+		var p string
+		if rows.Scan(&id, &p) == nil && !seen[p] {
+			gone = append(gone, id)
+		}
+	}
+	rows.Close()
+	for _, id := range gone {
+		l.db.Exec(`DELETE FROM videos WHERE id = ?`, id)
+		os.RemoveAll(filepath.Join(l.servingDir, strconv.FormatInt(id, 10)))
+	}
+	log.Printf("scan: %d videos, %d removed", len(seen), len(gone))
+}
+
+func sameDir(a, b string) bool {
+	x, err1 := os.Stat(a)
+	y, err2 := os.Stat(b)
+	return err1 == nil && err2 == nil && os.SameFile(x, y)
+}
+
+// uploadHandler stores the file under <library>/uploads and registers it as new.
+func (l *library) uploadHandler(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		http.Error(w, "bad multipart form", http.StatusBadRequest)
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "missing file field", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	name := unsafeName.ReplaceAllString(filepath.Base(header.Filename), "_")
+	if !videoExts[strings.ToLower(filepath.Ext(name))] {
+		http.Error(w, "unsupported file type", http.StatusBadRequest)
+		return
+	}
+	dir := filepath.Join(l.root, "uploads")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		http.Error(w, "cannot create dir", http.StatusInternalServerError)
+		return
+	}
+	path := filepath.Join(dir, name)
+	if _, err := os.Stat(path); err == nil {
+		path = filepath.Join(dir, fmt.Sprintf("%d_%s", time.Now().Unix(), name))
+	}
+
+	tmp := path + ".part" // not a video ext, so a concurrent scan skips it
+	dst, err := os.Create(tmp)
+	if err != nil {
+		http.Error(w, "cannot create file", http.StatusInternalServerError)
+		return
+	}
+	_, err = io.Copy(dst, file)
+	if cerr := dst.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
+		os.Remove(tmp)
+		http.Error(w, "write failed", http.StatusInternalServerError)
+		return
+	}
+	info, err := os.Stat(path)
+	if err == nil {
+		err = l.upsert(path, info)
+	}
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// optimizeHandler queues the selected new/failed videos for HLS transcode.
+func optimizeHandler(db *sql.DB, queue chan<- int64) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseMultipartForm(32 << 20); err != nil {
-			http.Error(w, "bad multipart form", http.StatusBadRequest)
+		var req struct {
+			IDs []int64 `json:"ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
 			return
 		}
-		file, header, err := r.FormFile("file")
-		if err != nil {
-			http.Error(w, "missing file field", http.StatusBadRequest)
-			return
+		var queued []int64
+		for _, id := range req.IDs {
+			res, err := db.Exec(`UPDATE videos SET status = 'pending', updated_at = CURRENT_TIMESTAMP
+				WHERE id = ? AND status IN ('new', 'failed')`, id)
+			if err != nil {
+				continue
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				queued = append(queued, id)
+			}
 		}
-		defer file.Close()
-
-		res, err := db.Exec(`INSERT INTO videos (filename, raw_path) VALUES (?, ?)`, header.Filename, "")
-		if err != nil {
-			http.Error(w, "db error", http.StatusInternalServerError)
-			return
-		}
-		id, _ := res.LastInsertId()
-
-		safeName := unsafeName.ReplaceAllString(header.Filename, "_")
-		rawPath := filepath.Join(uploadDir, fmt.Sprintf("%d_%s", id, safeName))
-
-		dst, err := os.Create(rawPath)
-		if err != nil {
-			http.Error(w, "cannot create file", http.StatusInternalServerError)
-			return
-		}
-		defer dst.Close()
-		if _, err := io.Copy(dst, file); err != nil {
-			http.Error(w, "write failed", http.StatusInternalServerError)
-			return
-		}
-
-		if _, err := db.Exec(`UPDATE videos SET raw_path = ? WHERE id = ?`, rawPath, id); err != nil {
-			http.Error(w, "db error", http.StatusInternalServerError)
-			return
-		}
-
-		queue <- id
-
+		go func() { // queue is bounded; don't block the request
+			for _, id := range queued {
+				queue <- id
+			}
+		}()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		json.NewEncoder(w).Encode(map[string]any{"id": id, "status": "pending"})
+		json.NewEncoder(w).Encode(map[string]any{"queued": len(queued)})
 	}
 }
 
-func listHandler(db *sql.DB) http.HandlerFunc {
+// rawHandler serves the original file (range requests) for unoptimized playback.
+// The path comes from the DB by id, never from the client.
+func rawHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		rows, err := db.Query(`SELECT id, filename, status, created_at FROM videos ORDER BY id DESC`)
+		var p string
+		if err := db.QueryRow(`SELECT raw_path FROM videos WHERE id = ?`, r.PathValue("id")).Scan(&p); err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeFile(w, r, p)
+	}
+}
+
+type meta struct {
+	Duration       float64
+	Width, Height  int
+	VCodec, ACodec string
+}
+
+// probe reads duration/resolution/codecs with ffprobe; zero meta on failure.
+func probe(path string) meta {
+	var m meta
+	out, err := exec.Command("ffprobe", "-v", "error",
+		"-show_entries", "format=duration:stream=codec_type,codec_name,width,height",
+		"-of", "json", path).Output()
+	if err != nil {
+		log.Printf("probe %s: %v", path, err)
+		return m
+	}
+	var p struct {
+		Format  struct{ Duration string }
+		Streams []struct {
+			CodecType string `json:"codec_type"`
+			CodecName string `json:"codec_name"`
+			Width     int
+			Height    int
+		}
+	}
+	if json.Unmarshal(out, &p) != nil {
+		return m
+	}
+	m.Duration, _ = strconv.ParseFloat(p.Format.Duration, 64)
+	for _, s := range p.Streams {
+		switch {
+		case s.CodecType == "video" && m.VCodec == "":
+			m.VCodec, m.Width, m.Height = s.CodecName, s.Width, s.Height
+		case s.CodecType == "audio" && m.ACodec == "":
+			m.ACodec = s.CodecName
+		}
+	}
+	return m
+}
+
+// prober fills in metadata for rows with probed=0, one file at a time, so
+// scans stay fast. A file that changes mid-probe is left for the next pass.
+func (l *library) prober() {
+	for range l.wake {
+		for {
+			var id, size, mtime int64
+			var path string
+			if l.db.QueryRow(`SELECT id, raw_path, size, mtime FROM videos WHERE probed = 0 LIMIT 1`).
+				Scan(&id, &path, &size, &mtime) != nil {
+				break
+			}
+			m := probe(path)
+			if _, err := l.db.Exec(`UPDATE videos SET duration=?, width=?, height=?, vcodec=?, acodec=?, probed=1
+				WHERE id=? AND size=? AND mtime=?`,
+				m.Duration, m.Width, m.Height, m.VCodec, m.ACodec, id, size, mtime); err != nil {
+				log.Printf("probe %d: %v", id, err)
+				break
+			}
+		}
+	}
+}
+
+// browserNative guesses whether a browser can play the original: known
+// container + known codec. Unprobed files get the benefit of the doubt.
+func browserNative(path, vcodec string) bool {
+	if vcodec == "" {
+		return true
+	}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".mp4", ".m4v", ".webm":
+		switch vcodec {
+		case "h264", "vp8", "vp9", "av1":
+			return true
+		}
+	}
+	return false
+}
+
+// listHandler supports ?q= (path substring), ?status=, ?codec=, ?min_height=,
+// ?sort=name|mtime|size|added|duration|resolution, ?order=asc|desc.
+func listHandler(db *sql.DB) http.HandlerFunc {
+	sorts := map[string]string{"name": "filename COLLATE NOCASE", "mtime": "mtime", "size": "size", "added": "id",
+		"duration": "duration", "resolution": "height"}
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		where, args := []string{"1=1"}, []any{}
+		if s := q.Get("q"); s != "" {
+			where = append(where, "filename LIKE ?")
+			args = append(args, "%"+s+"%")
+		}
+		if s := q.Get("status"); s != "" {
+			where = append(where, "status = ?")
+			args = append(args, s)
+		}
+		if s := q.Get("codec"); s != "" {
+			where = append(where, "vcodec = ?")
+			args = append(args, s)
+		}
+		if h, err := strconv.Atoi(q.Get("min_height")); err == nil {
+			where = append(where, "height >= ?")
+			args = append(args, h)
+		}
+		col, ok := sorts[q.Get("sort")]
+		if !ok {
+			col = "id"
+		}
+		dir := "DESC"
+		if q.Get("order") == "asc" {
+			dir = "ASC"
+		}
+		rows, err := db.Query(`SELECT id, filename, status, size, mtime, duration, width, height, vcodec, acodec, created_at FROM videos WHERE `+
+			strings.Join(where, " AND ")+` ORDER BY `+col+` `+dir, args...)
 		if err != nil {
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return
@@ -275,18 +583,31 @@ func listHandler(db *sql.DB) http.HandlerFunc {
 		defer rows.Close()
 
 		type video struct {
-			ID        int64  `json:"id"`
-			Filename  string `json:"filename"`
-			Status    string `json:"status"`
-			CreatedAt string `json:"created_at"`
+			ID        int64   `json:"id"`
+			Title     string  `json:"title"`
+			Path      string  `json:"path"`
+			Status    string  `json:"status"`
+			Size      int64   `json:"size"`
+			MTime     int64   `json:"mtime"`
+			Duration  float64 `json:"duration"`
+			Width     int     `json:"width"`
+			Height    int     `json:"height"`
+			VCodec    string  `json:"vcodec"`
+			ACodec    string  `json:"acodec"`
+			Native    bool    `json:"native"`
+			CreatedAt string  `json:"created_at"`
 		}
 		items := []video{}
 		for rows.Next() {
 			var v video
-			if err := rows.Scan(&v.ID, &v.Filename, &v.Status, &v.CreatedAt); err != nil {
+			if err := rows.Scan(&v.ID, &v.Path, &v.Status, &v.Size, &v.MTime, &v.Duration, &v.Width, &v.Height,
+				&v.VCodec, &v.ACodec, &v.CreatedAt); err != nil {
 				http.Error(w, "db error", http.StatusInternalServerError)
 				return
 			}
+			v.Native = browserNative(v.Path, v.VCodec)
+			base := filepath.Base(v.Path)
+			v.Title = strings.TrimSuffix(base, filepath.Ext(base))
 			items = append(items, v)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -306,52 +627,6 @@ func streamHandler(servingDir string) http.Handler {
 		w.Header().Set("Accept-Ranges", "bytes")
 		fs.ServeHTTP(w, r)
 	})
-}
-
-// adoptOrphans finds files in uploadDir with no matching raw_path in the
-// db (e.g. dropped in manually, or left over from a crash before the DB
-// insert landed) and enqueues them as new pending videos. Startup only.
-func adoptOrphans(db *sql.DB, uploadDir string, queue chan<- int64) {
-	entries, err := os.ReadDir(uploadDir)
-	if err != nil {
-		log.Printf("adopt orphans: read %s: %v", uploadDir, err)
-		return
-	}
-
-	known := map[string]bool{}
-	rows, err := db.Query(`SELECT raw_path FROM videos`)
-	if err != nil {
-		log.Printf("adopt orphans: query: %v", err)
-		return
-	}
-	for rows.Next() {
-		var p string
-		if err := rows.Scan(&p); err != nil {
-			log.Printf("adopt orphans: scan: %v", err)
-			rows.Close()
-			return
-		}
-		known[p] = true
-	}
-	rows.Close()
-
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		path := filepath.Join(uploadDir, e.Name())
-		if known[path] {
-			continue
-		}
-		res, err := db.Exec(`INSERT INTO videos (filename, raw_path) VALUES (?, ?)`, e.Name(), path)
-		if err != nil {
-			log.Printf("adopt orphans: insert %s: %v", path, err)
-			continue
-		}
-		id, _ := res.LastInsertId()
-		log.Printf("adopted orphan file %s as video %d", path, id)
-		queue <- id
-	}
 }
 
 // reconcile re-enqueues any job left in pending/processing from a prior

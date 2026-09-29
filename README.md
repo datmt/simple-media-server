@@ -1,7 +1,8 @@
 # mediad
 
-Self-contained media streaming & ingestion engine. Single static Go binary:
-chunked upload, background `ffmpeg` HLS transcode, embedded UI, basic auth.
+Self-contained media library manager. Single static Go binary: recursive
+library scan, search/filter, on-demand `ffmpeg` HLS optimization, upload,
+embedded UI, basic auth.
 No external dependencies beyond `ffmpeg` on `$PATH`.
 
 ## Install
@@ -28,26 +29,34 @@ mediad adduser <user> <pass>      # create/update a basic-auth login in creds.js
 mediad --port=8080                # run the server
 ```
 
-Flags (all optional):
+Flags (`--library-dir` is required, the rest optional):
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--upload-dir` | `./uploads` | raw uploaded files |
+| `--library-dir` | *(required)* | media library root, scanned recursively; uploads go to `<library-dir>/uploads` |
 | `--serving-dir` | `./stream` | generated HLS output |
 | `--db-path` | `./media.db` | sqlite database |
 | `--creds-path` | `./creds.json` | basic-auth credentials |
 | `--port` | `8080` | HTTP listen port |
+| `--scan-interval` | `5m` | periodic library rescan (`0` disables); overlapping scans are skipped |
+
+`ffprobe` (bundled with `ffmpeg`) is used in the background to read duration,
+resolution and codecs.
 
 If `creds.json` doesn't exist or is empty, basic auth is disabled and a
 warning is logged on startup. Run `mediad adduser <user> <pass>` first to
 lock it down.
 
-Open `http://localhost:8080` for the built-in upload/playback UI, or use
-the API directly:
+Open `http://localhost:8080` for the built-in UI, or use the API directly.
+Videos start as `new` (not optimized) and play straight from the original
+file; select some and hit "Optimize" to transcode them to HLS (`ready`).
 
-- `POST /api/upload` — multipart `file` field, returns `{"id", "status"}`
-- `GET /api/videos` — list of videos with status
-- `GET /stream/{id}/playlist.m3u8` — HLS playback (byte-range aware)
+- `GET /api/videos` — list with duration/resolution/codecs; params `q`, `status`, `codec`, `min_height`, `sort` (`name|mtime|size|added|duration|resolution`), `order` (`asc|desc`)
+- `POST /api/scan` — rescan the library (also runs at startup)
+- `POST /api/upload` — multipart `file` field, saved into `<library-dir>/uploads`
+- `POST /api/optimize` — `{"ids":[1,2]}`, queue transcode for `new`/`failed` videos
+- `GET /api/raw/{id}` — original file (range-aware)
+- `GET /stream/{id}/playlist.m3u8` — HLS playback of optimized videos
 
 ## Build from source
 

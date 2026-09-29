@@ -2,76 +2,249 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>mediad</title>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
 <style>
-  body{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;background:#111;color:#eee}
-  video{width:100%;max-height:60vh;background:#000}
-  table{width:100%;border-collapse:collapse;margin-top:1rem}
-  td,th{text-align:left;padding:.4rem;border-bottom:1px solid #333}
-  .pending,.processing{color:#e0a800}
-  .ready{color:#4caf50}
-  .failed{color:#e53935}
-  a{color:#66b3ff;cursor:pointer}
-  form{margin-top:1rem}
+  :root{--bg:#0e1015;--panel:#161922;--line:#262b38;--text:#e6e8ee;--muted:#8a91a3;--accent:#5b8def;
+    --new:#8a91a3;--busy:#e0a800;--ok:#3ecf8e;--bad:#ef5350}
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--text)}
+  main{max-width:1100px;margin:0 auto;padding:1.25rem 1rem 4rem}
+  header{display:flex;align-items:baseline;gap:.75rem;margin-bottom:1rem}
+  h1{margin:0;font-size:1.25rem;letter-spacing:.02em}
+  #count{color:var(--muted)}
+
+  #stage{display:none;margin-bottom:1.25rem;background:#000;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  #stage.on{display:block}
+  video{display:block;width:100%;max-height:62vh;background:#000}
+  #now{padding:.6rem .9rem;background:var(--panel);display:flex;justify-content:space-between;gap:1rem}
+  #now span:last-child{color:var(--muted)}
+
+  .bar{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin-bottom:.75rem}
+  .bar .grow{flex:1}
+  input[type=search],select,button{font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--line);
+    border-radius:8px;padding:.45rem .7rem}
+  input[type=search]{min-width:220px;flex:1;max-width:360px}
+  input:focus,select:focus,button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  button{cursor:pointer}
+  button:hover:not(:disabled){border-color:var(--accent)}
+  button:disabled{opacity:.45;cursor:default}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  #fileInput{display:none}
+
+  .list{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .row{display:grid;grid-template-columns:32px minmax(0,1fr) 130px 70px 70px 80px 110px;gap:.75rem;align-items:center;
+    padding:.6rem .9rem;border-bottom:1px solid var(--line)}
+  .row:last-child{border-bottom:0}
+  .row.head{color:var(--muted);font-size:.8em;text-transform:uppercase;letter-spacing:.05em;padding-top:.5rem;padding-bottom:.5rem}
+  .row:not(.head){cursor:pointer}
+  .row:not(.head):hover{background:#1b1f2b}
+  .row.active{background:#1d2740}
+  .title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .path{color:var(--muted);font-size:.85em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .muted{color:var(--muted)}
+
+  .pill{display:inline-flex;align-items:center;gap:.4rem;font-size:.85em}
+  .pill::before{content:"";width:8px;height:8px;border-radius:50%;background:currentColor}
+  .new{color:var(--new)} .ready{color:var(--ok)} .failed{color:var(--bad)}
+  .pending,.processing{color:var(--busy)}
+  .processing::before{animation:pulse 1s ease-in-out infinite}
+  @keyframes pulse{50%{opacity:.25}}
+
+  #empty{padding:2.5rem 1rem;text-align:center;color:var(--muted)}
+  #drop{position:fixed;inset:0;background:rgba(14,16,21,.85);display:none;place-items:center;font-size:1.4rem;
+    border:3px dashed var(--accent);z-index:5}
+  #drop.on{display:grid}
+  #toast{position:fixed;bottom:1.25rem;left:50%;transform:translateX(-50%);background:var(--panel);
+    border:1px solid var(--line);border-radius:8px;padding:.6rem 1rem;opacity:0;pointer-events:none;transition:opacity .2s}
+  #toast.on{opacity:1}
+
+  @media(max-width:700px){
+    .row{grid-template-columns:28px minmax(0,1fr) 110px}
+    .row>:nth-child(n+4){display:none}
+  }
+  .warn{color:var(--busy);font-size:.8em;margin-left:.4rem}
 </style>
 </head>
 <body>
-<h1>mediad</h1>
-<video id="player" controls></video>
-<form id="uploadForm">
-  <input type="file" id="fileInput" accept="video/*" required>
-  <button type="submit">Upload</button>
-</form>
-<table>
-  <thead><tr><th>ID</th><th>Filename</th><th>Status</th><th>Created</th><th></th></tr></thead>
-  <tbody id="rows"></tbody>
-</table>
-<script>
-const rowsEl = document.getElementById('rows');
-const video = document.getElementById('player');
-let hls;
+<main>
+  <header><h1>mediad</h1><span id="count"></span></header>
 
-function play(id) {
-  const src = '/stream/' + id + '/playlist.m3u8';
-  if (hls) hls.destroy();
-  if (Hls.isSupported()) {
+  <section id="stage">
+    <video id="player" controls></video>
+    <div id="now"><span id="nowTitle"></span><span id="nowKind"></span></div>
+  </section>
+
+  <div class="bar">
+    <input id="q" type="search" placeholder="Search title or path…" aria-label="Search">
+    <select id="status" aria-label="Status filter">
+      <option value="">All statuses</option>
+      <option value="new">Not optimized</option>
+      <option value="pending">Pending</option>
+      <option value="processing">Processing</option>
+      <option value="ready">Optimized</option>
+      <option value="failed">Failed</option>
+    </select>
+    <select id="sort" aria-label="Sort by">
+      <option value="name">Title</option>
+      <option value="mtime">Modified</option>
+      <option value="size">Size</option>
+      <option value="duration">Duration</option>
+      <option value="resolution">Resolution</option>
+      <option value="added">Added</option>
+    </select>
+    <button id="order" title="Toggle sort order" aria-label="Toggle sort order">↑</button>
+    <span class="grow"></span>
+    <button id="rescan">Rescan</button>
+    <button id="upload">Upload</button>
+    <button id="optimize" class="primary" disabled>Optimize</button>
+    <input type="file" id="fileInput" accept="video/*" multiple>
+  </div>
+
+  <div class="list">
+    <div class="row head">
+      <input type="checkbox" id="all" aria-label="Select all">
+      <span>Title</span><span>Status</span><span>Length</span><span>Res</span><span>Size</span><span>Modified</span>
+    </div>
+    <div id="rows"></div>
+    <div id="empty" hidden>No videos match.</div>
+  </div>
+</main>
+<div id="drop">Drop videos to upload</div>
+<div id="toast" role="status"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const video = $('player');
+const selected = new Set();
+const label = {new: 'Not optimized', ready: 'Optimized', pending: 'Pending', processing: 'Processing', failed: 'Failed'};
+let hls, playing = null, order = 'asc', items = [];
+
+const esc = s => s.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
+const size = n => n >= 1073741824 ? (n / 1073741824).toFixed(2) + ' GB' : (n / 1048576).toFixed(1) + ' MB';
+const dur = s => {
+  if (!s) return '—';
+  s = Math.round(s);
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+  return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(x).padStart(2, '0');
+};
+const date = t => new Date(t * 1000).toLocaleDateString(undefined, {year: 'numeric', month: 'short', day: 'numeric'});
+
+let toastTimer;
+function toast(msg) {
+  $('toast').textContent = msg;
+  $('toast').classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => $('toast').classList.remove('on'), 2500);
+}
+
+function play(v) {
+  playing = v.id;
+  if (hls) { hls.destroy(); hls = null; }
+  const ready = v.status === 'ready';
+  if (ready && Hls.isSupported()) {
     hls = new Hls();
-    hls.loadSource(src);
+    hls.loadSource(`/stream/${v.id}/playlist.m3u8`);
     hls.attachMedia(video);
   } else {
-    video.src = src;
+    video.src = ready ? `/stream/${v.id}/playlist.m3u8` : `/api/raw/${v.id}`;
   }
-  video.play();
+  video.play().catch(() => toast('Cannot play this file in the browser — optimize it first'));
+  $('nowTitle').textContent = v.title;
+  $('nowKind').textContent = ready ? 'HLS' : 'Original file';
+  $('stage').classList.add('on');
+  $('stage').scrollIntoView({behavior: 'smooth', block: 'nearest'});
+  render();
+}
+
+function render() {
+  $('rows').innerHTML = items.map(v => `
+    <div class="row ${v.id === playing ? 'active' : ''}" data-id="${v.id}">
+      <input type="checkbox" ${selected.has(v.id) ? 'checked' : ''} aria-label="Select">
+      <div style="min-width:0"><div class="title">${esc(v.title)}${!v.native && v.status !== 'ready' ? `<span class="warn" title="${esc(v.vcodec)} may not play in browsers">optimize to play</span>` : ''}</div><div class="path">${esc(v.path)}</div></div>
+      <span class="pill ${v.status}">${label[v.status] || v.status}</span>
+      <span class="muted">${dur(v.duration)}</span>
+      <span class="muted">${v.height ? v.height + 'p' : '—'}</span>
+      <span class="muted">${size(v.size)}</span>
+      <span class="muted">${date(v.mtime)}</span>
+    </div>`).join('');
+  $('empty').hidden = items.length > 0;
+  $('count').textContent = items.length + (items.length === 1 ? ' video' : ' videos');
+  const n = [...selected].filter(id => items.some(v => v.id === id && (v.status === 'new' || v.status === 'failed'))).length;
+  $('optimize').disabled = n === 0;
+  $('optimize').textContent = n ? `Optimize (${n})` : 'Optimize';
 }
 
 async function refresh() {
-  const res = await fetch('/api/videos');
-  const items = await res.json();
-  rowsEl.innerHTML = items.map(v => `
-    <tr>
-      <td>${v.id}</td>
-      <td>${v.filename}</td>
-      <td class="${v.status}">${v.status}</td>
-      <td>${v.created_at}</td>
-      <td>${v.status === 'ready' ? `<a onclick="play(${v.id})">play</a>` : ''}</td>
-    </tr>`).join('');
+  const p = new URLSearchParams({q: $('q').value.trim(), status: $('status').value, sort: $('sort').value, order});
+  try {
+    items = await (await fetch('/api/videos?' + p)).json();
+  } catch { return; }
+  render();
 }
-window.play = play;
 
-document.getElementById('uploadForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const file = document.getElementById('fileInput').files[0];
-  if (!file) return;
-  const fd = new FormData();
-  fd.append('file', file);
-  await fetch('/api/upload', { method: 'POST', body: fd });
-  document.getElementById('fileInput').value = '';
+$('rows').addEventListener('click', e => {
+  const row = e.target.closest('.row');
+  if (!row) return;
+  const id = +row.dataset.id;
+  if (e.target.type === 'checkbox') {
+    e.target.checked ? selected.add(id) : selected.delete(id);
+    render();
+  } else {
+    play(items.find(v => v.id === id));
+  }
+});
+$('all').addEventListener('change', e => {
+  items.forEach(v => e.target.checked ? selected.add(v.id) : selected.delete(v.id));
+  render();
+});
+
+let debounce;
+$('q').addEventListener('input', () => { clearTimeout(debounce); debounce = setTimeout(refresh, 200); });
+['status', 'sort'].forEach(id => $(id).addEventListener('change', refresh));
+$('order').onclick = () => { order = order === 'asc' ? 'desc' : 'asc'; $('order').textContent = order === 'asc' ? '↑' : '↓'; refresh(); };
+
+$('optimize').onclick = async () => {
+  const res = await fetch('/api/optimize', {method: 'POST', body: JSON.stringify({ids: [...selected]})});
+  const {queued} = await res.json();
+  toast(`Queued ${queued} video${queued === 1 ? '' : 's'}`);
+  selected.clear(); $('all').checked = false;
   refresh();
+};
+$('rescan').onclick = async () => {
+  $('rescan').disabled = true;
+  await fetch('/api/scan', {method: 'POST'});
+  $('rescan').disabled = false;
+  toast('Library rescanned');
+  refresh();
+};
+
+async function upload(files) {
+  for (const file of files) {
+    toast(`Uploading ${file.name}…`);
+    const fd = new FormData();
+    fd.append('file', file);
+    const res = await fetch('/api/upload', {method: 'POST', body: fd});
+    if (!res.ok) { toast(`${file.name}: ${(await res.text()).trim()}`); await new Promise(r => setTimeout(r, 2000)); }
+  }
+  toast('Upload done');
+  refresh();
+}
+$('upload').onclick = () => $('fileInput').click();
+$('fileInput').onchange = e => { upload([...e.target.files]); e.target.value = ''; };
+
+let dragDepth = 0;
+addEventListener('dragenter', e => { e.preventDefault(); dragDepth++; $('drop').classList.add('on'); });
+addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; $('drop').classList.remove('on'); } });
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => {
+  e.preventDefault(); dragDepth = 0; $('drop').classList.remove('on');
+  if (e.dataTransfer.files.length) upload([...e.dataTransfer.files]);
 });
 
 refresh();
-setInterval(refresh, 2000);
+setInterval(refresh, 3000);
 </script>
 </body>
 </html>
