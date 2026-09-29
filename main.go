@@ -527,11 +527,8 @@ func (l *library) prober() {
 }
 
 // browserNative guesses whether a browser can play the original: known
-// container + known codec. Unprobed files get the benefit of the doubt.
+// container + known codec. Unprobed or unprobeable files count as not native.
 func browserNative(path, vcodec string) bool {
-	if vcodec == "" {
-		return true
-	}
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".mp4", ".m4v", ".webm":
 		switch vcodec {
