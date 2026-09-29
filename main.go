@@ -72,6 +72,7 @@ func main() {
 	optHeight := flag.Int("optimize-height", 360, "optimized video height in px (never upscales)")
 	optCRF := flag.Int("optimize-crf", 28, "x264 quality, 18 (best) to 35 (smallest)")
 	optPreset := flag.String("optimize-preset", "ultrafast", "x264 speed preset (ultrafast, veryfast, medium, ...)")
+	workers := flag.Int("workers", 2, "concurrent transcode jobs")
 	scanEvery := flag.Duration("scan-interval", 5*time.Minute, "how often to rescan the library (0 disables)")
 
 	if len(os.Args) > 1 && os.Args[1] == "help" {
@@ -126,7 +127,9 @@ func main() {
 	}
 
 	queue := make(chan int64, 100)
-	go worker(db, *servingDir, encodeOpts{*optHeight, *optCRF, *optPreset}, queue)
+	for i := 0; i < max(*workers, 1); i++ {
+		go worker(db, *servingDir, encodeOpts{*optHeight, *optCRF, *optPreset}, queue)
+	}
 	lib := &library{db: db, root: *libDir, servingDir: *servingDir, wake: make(chan struct{}, 1)}
 	go lib.prober()
 	lib.scan(true)

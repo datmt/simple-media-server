@@ -42,6 +42,7 @@ Flags (`--library-dir` is required, the rest optional):
 | `--optimize-height` | `360` | optimized video height in px, never upscaled |
 | `--optimize-crf` | `28` | x264 quality, 18 (best) to 35 (smallest) |
 | `--optimize-preset` | `ultrafast` | x264 speed preset; slower gives smaller files |
+| `--workers` | `2` | concurrent transcode jobs; raise on many-core servers |
 
 `ffprobe` (bundled with `ffmpeg`) is used in the background to read duration,
 resolution and codecs.
