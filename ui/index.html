@@ -103,6 +103,7 @@
     <button id="rescan">Rescan</button>
     <button id="upload">Upload</button>
     <button id="optimize" class="primary" disabled>Optimize</button>
+    <button id="reoptimize" disabled title="Re-encode with current settings, replacing the existing version">Re-optimize</button>
     <input type="file" id="fileInput" accept="video/*" multiple>
   </div>
 
@@ -180,6 +181,9 @@ function render() {
   const n = [...selected].filter(id => items.some(v => v.id === id && (v.status === 'new' || v.status === 'failed'))).length;
   $('optimize').disabled = n === 0;
   $('optimize').textContent = n ? `Optimize (${n})` : 'Optimize';
+  const r = [...selected].filter(id => items.some(v => v.id === id && v.status === 'ready')).length;
+  $('reoptimize').disabled = r === 0;
+  $('reoptimize').textContent = r ? `Re-optimize (${r})` : 'Re-optimize';
 }
 
 async function refresh() {
@@ -211,13 +215,15 @@ $('q').addEventListener('input', () => { clearTimeout(debounce); debounce = setT
 ['status', 'sort'].forEach(id => $(id).addEventListener('change', refresh));
 $('order').onclick = () => { order = order === 'asc' ? 'desc' : 'asc'; $('order').textContent = order === 'asc' ? '↑' : '↓'; refresh(); };
 
-$('optimize').onclick = async () => {
-  const res = await fetch('/api/optimize', {method: 'POST', body: JSON.stringify({ids: [...selected]})});
+$('optimize').onclick = () => queue(false);
+$('reoptimize').onclick = () => queue(true);
+async function queue(force) {
+  const res = await fetch('/api/optimize', {method: 'POST', body: JSON.stringify({ids: [...selected], force})});
   const {queued} = await res.json();
   toast(`Queued ${queued} video${queued === 1 ? '' : 's'}`);
   selected.clear(); $('all').checked = false;
   refresh();
-};
+}
 $('rescan').onclick = async () => {
   $('rescan').disabled = true;
   await fetch('/api/scan', {method: 'POST'});

@@ -72,6 +72,8 @@ func main() {
 	optHeight := flag.Int("optimize-height", 360, "optimized video height in px (never upscales)")
 	optCRF := flag.Int("optimize-crf", 28, "x264 quality, 18 (best) to 35 (smallest)")
 	optPreset := flag.String("optimize-preset", "ultrafast", "x264 speed preset (ultrafast, veryfast, medium, ...)")
+	optMaxrate := flag.Int("optimize-maxrate", 500, "video bitrate cap in kbps (0 = uncapped, quality-only)")
+	optAudio := flag.Int("optimize-audio-bitrate", 64, "audio bitrate in kbps")
 	workers := flag.Int("workers", 2, "concurrent transcode jobs")
 	scanEvery := flag.Duration("scan-interval", 5*time.Minute, "how often to rescan the library (0 disables)")
 
@@ -128,7 +130,7 @@ func main() {
 
 	queue := make(chan int64, 100)
 	for i := 0; i < max(*workers, 1); i++ {
-		go worker(db, *servingDir, encodeOpts{*optHeight, *optCRF, *optPreset}, queue)
+		go worker(db, *servingDir, encodeOpts{*optHeight, *optCRF, *optMaxrate, *optAudio, *optPreset}, queue)
 	}
 	lib := &library{db: db, root: *libDir, servingDir: *servingDir, wake: make(chan struct{}, 1)}
 	go lib.prober()
@@ -426,20 +428,25 @@ func (l *library) uploadHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// optimizeHandler queues the selected new/failed videos for HLS transcode.
+// optimizeHandler queues the selected new/failed (and, with force, ready) videos for HLS transcode.
 func optimizeHandler(db *sql.DB, queue chan<- int64) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			IDs []int64 `json:"ids"`
+			IDs   []int64 `json:"ids"`
+			Force bool    `json:"force"` // also re-encode ready videos, replacing the old HLS output
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad json", http.StatusBadRequest)
 			return
 		}
+		statuses := `'new', 'failed'`
+		if req.Force {
+			statuses += `, 'ready'`
+		}
 		var queued []int64
 		for _, id := range req.IDs {
 			res, err := db.Exec(`UPDATE videos SET status = 'pending', updated_at = CURRENT_TIMESTAMP
-				WHERE id = ? AND status IN ('new', 'failed')`, id)
+				WHERE id = ? AND status IN (`+statuses+`)`, id)
 			if err != nil {
 				continue
 			}
@@ -701,8 +708,8 @@ func reconcile(db *sql.DB, queue chan<- int64) {
 }
 
 type encodeOpts struct {
-	height, crf int
-	preset      string
+	height, crf, maxrate, audio int
+	preset                      string
 }
 
 func worker(db *sql.DB, servingDir string, opts encodeOpts, queue <-chan int64) {
@@ -724,23 +731,30 @@ func processOne(db *sql.DB, servingDir string, opts encodeOpts, id int64) {
 	}
 
 	outDir := filepath.Join(servingDir, strconv.FormatInt(id, 10))
+	os.RemoveAll(outDir) // clear stale chunks from a previous encode
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		log.Printf("job %d: mkdir failed: %v", id, err)
 		fail(db, id)
 		return
 	}
 
-	cmd := exec.Command("ffmpeg", "-y", "-i", rawPath,
+	args := []string{"-y", "-i", rawPath,
 		"-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
 		"-vf", fmt.Sprintf("scale=-2:'min(%d,ih)'", opts.height),
 		"-c:v", "libx264", "-preset", opts.preset, "-crf", strconv.Itoa(opts.crf),
+	}
+	if opts.maxrate > 0 {
+		args = append(args, "-maxrate", fmt.Sprintf("%dk", opts.maxrate), "-bufsize", fmt.Sprintf("%dk", opts.maxrate*2))
+	}
+	args = append(args,
 		"-profile:v", "main", "-pix_fmt", "yuv420p",
-		"-c:a", "aac", "-b:a", "96k", "-ac", "2",
+		"-c:a", "aac", "-b:a", fmt.Sprintf("%dk", opts.audio), "-ac", "2",
 		"-hls_time", "4",
 		"-hls_playlist_type", "vod",
 		"-hls_segment_filename", filepath.Join(outDir, "chunk_%03d.ts"),
 		filepath.Join(outDir, "playlist.m3u8"),
 	)
+	cmd := exec.Command("ffmpeg", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		log.Printf("job %d: ffmpeg failed: %v\n%s", id, err, out)
 		fail(db, id)
