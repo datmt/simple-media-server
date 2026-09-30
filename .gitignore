@@ -6,3 +6,5 @@
 /creds.json
 /log
 /media.db*
+/cert.pem
+/key.pem

@@ -37,7 +37,9 @@ Flags (`--library-dir` is required, the rest optional):
 | `--serving-dir` | `./stream` | generated HLS output |
 | `--db-path` | `./media.db` | sqlite database |
 | `--creds-path` | `./creds.json` | basic-auth credentials |
-| `--port` | `8080` | HTTP listen port |
+| `--port` | `8080` | listen port |
+| `--tls` | `true` | serve HTTPS with a self-signed cert; `--tls=false` for plain HTTP |
+| `--tls-dir` | `.` | holds `cert.pem`/`key.pem`, generated on first start (10y, covers localhost, hostname, local IPs); drop in your own to override |
 | `--scan-interval` | `5m` | periodic library rescan (`0` disables); overlapping scans are skipped |
 | `--optimize-crf` | `28` | x264 quality, 18 (best) to 35 (smallest) |
 | `--optimize-preset` | `ultrafast` | x264 speed preset; slower gives smaller files |
@@ -51,7 +53,7 @@ If `creds.json` doesn't exist or is empty, basic auth is disabled and a
 warning is logged on startup. Run `mediad adduser <user> <pass>` first to
 lock it down.
 
-Open `http://localhost:8080` for the built-in UI, or use the API directly.
+Open `https://localhost:8080` (accept the self-signed cert warning, or use `--tls=false` for `http://`) for the built-in UI, or use the API directly.
 Videos start as `new` (not optimized) and play straight from the original
 file; select some and hit "Optimize" to transcode them to HLS (`ready`).
 

@@ -1,16 +1,24 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/subtle"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"database/sql"
 	"embed"
 	"encoding/binary"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -69,7 +77,9 @@ func main() {
 	servingDir := flag.String("serving-dir", "./stream", "target directory for generated HLS assets")
 	dbPath := flag.String("db-path", "./media.db", "path to the sqlite database file")
 	credsPath := flag.String("creds-path", "./creds.json", "path to the basic-auth credentials file")
-	port := flag.Int("port", 8080, "http listen port")
+	port := flag.Int("port", 8080, "listen port")
+	useTLS := flag.Bool("tls", true, "serve HTTPS with a self-signed cert (--tls=false for plain HTTP)")
+	tlsDir := flag.String("tls-dir", ".", "directory holding cert.pem/key.pem (generated if missing)")
 	optCRF := flag.Int("optimize-crf", 28, "x264 quality, 18 (best) to 35 (smallest)")
 	optPreset := flag.String("optimize-preset", "ultrafast", "x264 speed preset (ultrafast, veryfast, medium, ...)")
 	optAudio := flag.Int("optimize-audio-bitrate", 64, "audio bitrate in kbps")
@@ -157,8 +167,63 @@ func main() {
 	mux.HandleFunc("GET /{$}", indexHandler)
 
 	addr := fmt.Sprintf(":%d", *port)
-	log.Printf("mediad listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, basicAuth(creds, mux)))
+	h := basicAuth(creds, mux)
+	if !*useTLS {
+		log.Printf("mediad listening on http://%s", addr)
+		log.Fatal(http.ListenAndServe(addr, h))
+	}
+	cert, key := filepath.Join(*tlsDir, "cert.pem"), filepath.Join(*tlsDir, "key.pem")
+	if err := ensureCert(cert, key); err != nil {
+		log.Fatalf("tls cert: %v", err)
+	}
+	log.Printf("mediad listening on https://%s (self-signed, %s)", addr, cert)
+	log.Fatal(http.ListenAndServeTLS(addr, cert, key, h))
+}
+
+// ensureCert writes a self-signed cert (10y) for localhost, the hostname and
+// local interface IPs, unless both files already exist.
+func ensureCert(certPath, keyPath string) error {
+	if _, err := os.Stat(certPath); err == nil {
+		if _, err := os.Stat(keyPath); err == nil {
+			return nil
+		}
+	}
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return err
+	}
+	host, _ := os.Hostname()
+	tpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: "mediad"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().AddDate(10, 0, 0),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
+	}
+	if host != "" {
+		tpl.DNSNames = append(tpl.DNSNames, host)
+	}
+	addrs, _ := net.InterfaceAddrs()
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok && !ipn.IP.IsLoopback() {
+			tpl.IPAddresses = append(tpl.IPAddresses, ipn.IP)
+		}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &priv.PublicKey, priv)
+	if err != nil {
+		return err
+	}
+	kb, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}), 0o600); err != nil {
+		return err
+	}
+	return os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644)
 }
 
 // basicAuth wraps a handler requiring HTTP basic auth against the given
