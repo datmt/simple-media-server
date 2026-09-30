@@ -781,10 +781,19 @@ func listHandler(db *sql.DB) http.HandlerFunc {
 		if q.Get("order") == "asc" {
 			dir = "ASC"
 		}
+		limit, err := strconv.Atoi(q.Get("limit"))
+		if err != nil || limit < 1 || limit > 10000 {
+			limit = 100
+		}
+		offset, _ := strconv.Atoi(q.Get("offset"))
 		user, _, _ := r.BasicAuth()
+		cond := strings.Join(where, " AND ")
+		var total int
+		db.QueryRow(`SELECT COUNT(*) FROM videos WHERE `+cond, args...).Scan(&total)
+		// id tiebreaker keeps pages stable when the sort column has duplicates
 		rows, err := db.Query(`SELECT id, filename, status, size, mtime, duration, width, height, vcodec, acodec, renditions, created_at,
 			COALESCE((SELECT pos FROM progress WHERE video_id = videos.id AND user = ?), 0) FROM videos WHERE `+
-			strings.Join(where, " AND ")+` ORDER BY `+col+` `+dir, append([]any{user}, args...)...)
+			cond+` ORDER BY `+col+` `+dir+`, id `+dir+` LIMIT ? OFFSET ?`, append(append([]any{user}, args...), limit, max(offset, 0))...)
 		if err != nil {
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return
@@ -836,7 +845,10 @@ func listHandler(db *sql.DB) http.HandlerFunc {
 			items = append(items, v)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(items)
+		json.NewEncoder(w).Encode(struct {
+			Total int     `json:"total"`
+			Items []video `json:"items"`
+		}{total, items})
 	}
 }
 

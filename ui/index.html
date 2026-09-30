@@ -33,6 +33,7 @@
   button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
   #fileInput{display:none}
 
+  #more{display:block;width:100%;border:0;border-top:1px solid var(--line);border-radius:0;padding:10px}
   .list{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
   .row{display:grid;grid-template-columns:32px 84px minmax(0,1fr) 130px 70px 70px 80px 110px;gap:.75rem;align-items:center;
     padding:.6rem .9rem;border-bottom:1px solid var(--line)}
@@ -116,6 +117,7 @@
     </div>
     <div id="rows"></div>
     <div id="empty" hidden>No videos match.</div>
+    <button id="more" hidden>Load more</button>
   </div>
 </main>
 <div id="drop">Drop videos to upload</div>
@@ -125,8 +127,9 @@
 const $ = id => document.getElementById(id);
 const video = $('player');
 const selected = new Set();
+const PAGE = 100;
 const label = {new: 'Not optimized', ready: 'Optimized', pending: 'Pending', processing: 'Processing', failed: 'Failed'};
-let hls, playing = null, order = 'asc', items = [];
+let hls, playing = null, order = 'asc', items = [], total = 0, want = PAGE;
 
 const esc = s => s.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 const size = n => n >= 1073741824 ? (n / 1073741824).toFixed(2) + ' GB' : (n / 1048576).toFixed(1) + ' MB';
@@ -214,7 +217,9 @@ function render() {
       <span class="muted">${date(v.mtime)}</span>
     </div>`).join('');
   $('empty').hidden = items.length > 0;
-  $('count').textContent = items.length + (items.length === 1 ? ' video' : ' videos');
+  $('count').textContent = total + (total === 1 ? ' video' : ' videos');
+  $('more').hidden = items.length >= total;
+  $('more').textContent = `Load more (${total - items.length} left)`;
   const n = [...selected].filter(id => items.some(v => v.id === id && (v.status === 'new' || v.status === 'failed'))).length;
   $('optimize').disabled = n === 0;
   $('optimize').textContent = n ? `Optimize (${n})` : 'Optimize';
@@ -223,13 +228,16 @@ function render() {
   $('reoptimize').textContent = r ? `Re-optimize (${r})` : 'Re-optimize';
 }
 
-async function refresh() {
-  const p = new URLSearchParams({q: $('q').value.trim(), status: $('status').value, sort: $('sort').value, order});
+// Re-fetches everything loaded so far (offset 0, limit=want) so polling keeps status pills fresh.
+async function refresh(reset = true) {
+  if (reset !== false) want = PAGE;
+  const p = new URLSearchParams({q: $('q').value.trim(), status: $('status').value, sort: $('sort').value, order, limit: want});
   try {
-    items = await (await fetch('/api/videos?' + p)).json();
+    ({items, total} = await (await fetch('/api/videos?' + p)).json());
   } catch { return; }
   render();
 }
+$('more').onclick = () => { want += PAGE; refresh(false); };
 
 $('rows').addEventListener('click', e => {
   const row = e.target.closest('.row');
@@ -293,7 +301,7 @@ addEventListener('drop', e => {
 });
 
 refresh();
-setInterval(refresh, 3000);
+setInterval(() => refresh(false), 3000);
 </script>
 </body>
 </html>
