@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -177,7 +178,61 @@ func main() {
 		log.Fatalf("tls cert: %v", err)
 	}
 	log.Printf("mediad listening on https://%s (self-signed, %s)", addr, cert)
-	log.Fatal(http.ListenAndServeTLS(addr, cert, key, h))
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tlsLn, plainLn := splitListener(ln)
+	go http.Serve(plainLn, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://"+r.Host+r.URL.RequestURI(), http.StatusPermanentRedirect)
+	}))
+	log.Fatal((&http.Server{Handler: h}).ServeTLS(tlsLn, cert, key))
+}
+
+type peekConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *peekConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+type chanListener struct {
+	ch   chan net.Conn
+	addr net.Addr
+}
+
+func (l *chanListener) Accept() (net.Conn, error) { return <-l.ch, nil }
+func (l *chanListener) Close() error              { return nil }
+func (l *chanListener) Addr() net.Addr            { return l.addr }
+
+// splitListener serves TLS and plain HTTP on one port by peeking the first
+// byte: 0x16 is a TLS handshake, anything else goes to the plain listener.
+func splitListener(l net.Listener) (tlsL, plainL net.Listener) {
+	t := &chanListener{make(chan net.Conn), l.Addr()}
+	p := &chanListener{make(chan net.Conn), l.Addr()}
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				log.Fatal(err)
+			}
+			go func() {
+				pc := &peekConn{c, bufio.NewReader(c)}
+				c.SetReadDeadline(time.Now().Add(10 * time.Second))
+				b, err := pc.r.Peek(1)
+				c.SetReadDeadline(time.Time{})
+				switch {
+				case err != nil:
+					c.Close()
+				case b[0] == 0x16:
+					t.ch <- pc
+				default:
+					p.ch <- pc
+				}
+			}()
+		}
+	}()
+	return t, p
 }
 
 // ensureCert writes a self-signed cert (10y) for localhost, the hostname and

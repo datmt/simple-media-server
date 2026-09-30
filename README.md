@@ -38,7 +38,7 @@ Flags (`--library-dir` is required, the rest optional):
 | `--db-path` | `./media.db` | sqlite database |
 | `--creds-path` | `./creds.json` | basic-auth credentials |
 | `--port` | `8080` | listen port |
-| `--tls` | `true` | serve HTTPS with a self-signed cert; `--tls=false` for plain HTTP |
+| `--tls` | `true` | serve HTTPS with a self-signed cert; `--tls=false` for plain HTTP; plain HTTP on the same port redirects to HTTPS |
 | `--tls-dir` | `.` | holds `cert.pem`/`key.pem`, generated on first start (10y, covers localhost, hostname, local IPs); drop in your own to override |
 | `--scan-interval` | `5m` | periodic library rescan (`0` disables); overlapping scans are skipped |
 | `--optimize-crf` | `28` | x264 quality, 18 (best) to 35 (smallest) |
