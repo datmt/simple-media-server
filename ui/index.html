@@ -43,6 +43,7 @@
   .row.active{background:#1d2740}
   .title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .path{color:var(--muted);font-size:.85em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .path.wrap{white-space:normal;overflow-wrap:anywhere}
   .muted{color:var(--muted)}
   .thumb{width:84px;height:47px;object-fit:cover;border-radius:4px;background:#0e1015}
   .mmeta{display:none;color:var(--muted);font-size:.8em}
@@ -190,7 +191,7 @@ function render() {
     <div class="row ${v.id === playing ? 'active' : ''}" data-id="${v.id}">
       <input type="checkbox" ${selected.has(v.id) ? 'checked' : ''} aria-label="Select">
       <img class="thumb" loading="lazy" src="/stream/thumbs/${v.id}.jpg?v=${v.mtime}" alt="" onerror="this.style.visibility='hidden'">
-      <div style="min-width:0"><div class="title">${esc(v.title)}${!v.native && v.status !== 'ready' ? `<span class="warn" title="${esc(v.vcodec)} may not play in browsers">optimize to play</span>` : ''}</div><div class="path">${esc(v.path)}</div><div class="path">${detail(v)}</div><div class="mmeta">${dur(v.duration)} · ${size(v.size)}</div></div>
+      <div style="min-width:0"><div class="title">${esc(v.title)}${!v.native && v.status !== 'ready' ? `<span class="warn" title="${esc(v.vcodec)} may not play in browsers">optimize to play</span>` : ''}</div><div class="path">${esc(v.path)}</div><div class="path wrap">${detail(v)}</div><div class="mmeta">${dur(v.duration)} · ${size(v.size)}</div></div>
       <span class="pill ${v.status}">${label[v.status] || v.status}</span>
       <span class="muted">${dur(v.duration)}</span>
       <span class="muted">${v.height ? v.height + 'p' : '—'}</span>
