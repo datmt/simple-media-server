@@ -110,6 +110,7 @@ func main() {
 	// Older schemas lack the probe columns: drop the table and its stale HLS output.
 	if _, err := db.Exec(`SELECT probed FROM videos LIMIT 0`); err != nil {
 		db.Exec(`DROP TABLE IF EXISTS videos`)
+		db.Exec(`DROP TABLE IF EXISTS progress`)
 		if ents, err := os.ReadDir(*servingDir); err == nil {
 			for _, e := range ents {
 				os.RemoveAll(filepath.Join(*servingDir, e.Name()))
@@ -135,6 +136,12 @@ func main() {
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);
+		CREATE TABLE IF NOT EXISTS progress (
+			user TEXT NOT NULL,
+			video_id INTEGER NOT NULL,
+			pos REAL NOT NULL,
+			PRIMARY KEY (user, video_id)
+		);
 	`); err != nil {
 		log.Fatalf("migrate: %v", err)
 	}
@@ -164,6 +171,7 @@ func main() {
 	mux.HandleFunc("POST /api/optimize", optimizeHandler(db, queue))
 	mux.HandleFunc("GET /api/raw/{id}", rawHandler(db))
 	mux.HandleFunc("GET /api/videos", listHandler(db))
+	mux.HandleFunc("POST /api/progress/{id}", progressHandler(db))
 	mux.Handle("GET /stream/", http.StripPrefix("/stream/", streamHandler(*servingDir)))
 	mux.HandleFunc("GET /{$}", indexHandler)
 
@@ -480,6 +488,7 @@ func (l *library) scan(block bool) {
 	rows.Close()
 	for _, id := range gone {
 		l.db.Exec(`DELETE FROM videos WHERE id = ?`, id)
+		l.db.Exec(`DELETE FROM progress WHERE video_id = ?`, id)
 		os.RemoveAll(filepath.Join(l.servingDir, strconv.FormatInt(id, 10)))
 		os.Remove(l.thumbPath(id))
 	}
@@ -721,6 +730,27 @@ func browserNative(path, vcodec string) bool {
 
 // listHandler supports ?q= (path substring), ?status=, ?codec=, ?min_height=,
 // ?sort=name|mtime|size|added|duration|resolution, ?order=asc|desc.
+// progressHandler stores the caller's resume position (seconds) for a video.
+// pos<=0 clears it. The user is the basic-auth name ("" when auth is off).
+func progressHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user, _, _ := r.BasicAuth()
+		id, err1 := strconv.ParseInt(r.PathValue("id"), 10, 64)
+		pos, err2 := strconv.ParseFloat(r.URL.Query().Get("pos"), 64)
+		if err1 != nil || err2 != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if pos <= 0 {
+			db.Exec(`DELETE FROM progress WHERE user = ? AND video_id = ?`, user, id)
+		} else {
+			db.Exec(`INSERT INTO progress(user, video_id, pos) VALUES(?,?,?)
+				ON CONFLICT(user, video_id) DO UPDATE SET pos = excluded.pos`, user, id, pos)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
 func listHandler(db *sql.DB) http.HandlerFunc {
 	sorts := map[string]string{"name": "filename COLLATE NOCASE", "mtime": "mtime", "size": "size", "added": "id",
 		"duration": "duration", "resolution": "height"}
@@ -751,8 +781,10 @@ func listHandler(db *sql.DB) http.HandlerFunc {
 		if q.Get("order") == "asc" {
 			dir = "ASC"
 		}
-		rows, err := db.Query(`SELECT id, filename, status, size, mtime, duration, width, height, vcodec, acodec, renditions, created_at FROM videos WHERE `+
-			strings.Join(where, " AND ")+` ORDER BY `+col+` `+dir, args...)
+		user, _, _ := r.BasicAuth()
+		rows, err := db.Query(`SELECT id, filename, status, size, mtime, duration, width, height, vcodec, acodec, renditions, created_at,
+			COALESCE((SELECT pos FROM progress WHERE video_id = videos.id AND user = ?), 0) FROM videos WHERE `+
+			strings.Join(where, " AND ")+` ORDER BY `+col+` `+dir, append([]any{user}, args...)...)
 		if err != nil {
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return
@@ -775,13 +807,14 @@ func listHandler(db *sql.DB) http.HandlerFunc {
 			Renditions []rendition `json:"renditions"`
 			Kind       string      `json:"kind,omitempty"` // "mp4" = progressive, not HLS
 			CreatedAt  string      `json:"created_at"`
+			Pos        float64     `json:"pos"` // resume position, seconds
 		}
 		items := []video{}
 		for rows.Next() {
 			var v video
 			var rend string
 			if err := rows.Scan(&v.ID, &v.Path, &v.Status, &v.Size, &v.MTime, &v.Duration, &v.Width, &v.Height,
-				&v.VCodec, &v.ACodec, &rend, &v.CreatedAt); err != nil {
+				&v.VCodec, &v.ACodec, &rend, &v.CreatedAt, &v.Pos); err != nil {
 				http.Error(w, "db error", http.StatusInternalServerError)
 				return
 			}

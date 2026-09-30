@@ -148,8 +148,23 @@ function toast(msg) {
   toastTimer = setTimeout(() => $('toast').classList.remove('on'), 2500);
 }
 
+let lastSave = 0;
+const savePos = (pos = video.currentTime) => {
+  if (!playing) return;
+  const d = video.duration;
+  if (d && d - pos < 10) pos = 0; // finished: clear
+  const v = items.find(x => x.id === playing);
+  if (v) v.pos = pos;
+  fetch(`/api/progress/${playing}?pos=${pos}`, {method: 'POST', keepalive: true});
+};
+video.ontimeupdate = () => { if (Date.now() - lastSave > 5000) { lastSave = Date.now(); savePos(); } };
+video.onpause = video.onended = () => savePos();
+addEventListener('pagehide', () => savePos());
+
 function play(v) {
+  if (playing && playing !== v.id) savePos();
   playing = v.id;
+  if (v.pos > 5) video.addEventListener('loadedmetadata', () => video.currentTime = v.pos, {once: true});
   if (hls) { hls.destroy(); hls = null; }
   $('quality').hidden = true;
   const ready = v.status === 'ready';
