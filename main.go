@@ -979,8 +979,12 @@ func processOne(db *sql.DB, servingDir string, opts encodeOpts, id int64) {
 			fail(db, id)
 			return
 		}
+		vf := fmt.Sprintf("scale=-2:'min(%d,ih)'", r.height)
+		if r.height <= 360 {
+			vf += ",fps=15" // ponytail: fixed 15fps on low rungs, upsamples sub-15fps sources (dup frames, cheap)
+		}
 		args = append(args, "-map", "0:v:0",
-			"-filter:v:"+n, fmt.Sprintf("scale=-2:'min(%d,ih)'", r.height),
+			"-filter:v:"+n, vf,
 			"-maxrate:v:"+n, fmt.Sprintf("%dk", r.maxrate), "-bufsize:v:"+n, fmt.Sprintf("%dk", r.maxrate*2))
 		v := "v:" + n
 		if hasAudio {
