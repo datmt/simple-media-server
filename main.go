@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"embed"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -69,10 +70,8 @@ func main() {
 	dbPath := flag.String("db-path", "./media.db", "path to the sqlite database file")
 	credsPath := flag.String("creds-path", "./creds.json", "path to the basic-auth credentials file")
 	port := flag.Int("port", 8080, "http listen port")
-	optHeight := flag.Int("optimize-height", 360, "optimized video height in px (never upscales)")
 	optCRF := flag.Int("optimize-crf", 28, "x264 quality, 18 (best) to 35 (smallest)")
 	optPreset := flag.String("optimize-preset", "ultrafast", "x264 speed preset (ultrafast, veryfast, medium, ...)")
-	optMaxrate := flag.Int("optimize-maxrate", 500, "video bitrate cap in kbps (0 = uncapped, quality-only)")
 	optAudio := flag.Int("optimize-audio-bitrate", 64, "audio bitrate in kbps")
 	workers := flag.Int("workers", 2, "concurrent transcode jobs")
 	scanEvery := flag.Duration("scan-interval", 5*time.Minute, "how often to rescan the library (0 disables)")
@@ -120,6 +119,7 @@ func main() {
 			height INTEGER NOT NULL DEFAULT 0,
 			vcodec TEXT NOT NULL DEFAULT '',
 			acodec TEXT NOT NULL DEFAULT '',
+			renditions TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);
@@ -127,10 +127,11 @@ func main() {
 	`); err != nil {
 		log.Fatalf("migrate: %v", err)
 	}
+	db.Exec(`ALTER TABLE videos ADD COLUMN renditions TEXT NOT NULL DEFAULT ''`) // existing DBs; errors if present
 
 	queue := make(chan int64, 100)
 	for i := 0; i < max(*workers, 1); i++ {
-		go worker(db, *servingDir, encodeOpts{*optHeight, *optCRF, *optMaxrate, *optAudio, *optPreset}, queue)
+		go worker(db, *servingDir, encodeOpts{*optCRF, *optAudio, *optPreset}, queue)
 	}
 	lib := &library{db: db, root: *libDir, servingDir: *servingDir, wake: make(chan struct{}, 1)}
 	go lib.prober()
@@ -630,7 +631,7 @@ func listHandler(db *sql.DB) http.HandlerFunc {
 		if q.Get("order") == "asc" {
 			dir = "ASC"
 		}
-		rows, err := db.Query(`SELECT id, filename, status, size, mtime, duration, width, height, vcodec, acodec, created_at FROM videos WHERE `+
+		rows, err := db.Query(`SELECT id, filename, status, size, mtime, duration, width, height, vcodec, acodec, renditions, created_at FROM videos WHERE `+
 			strings.Join(where, " AND ")+` ORDER BY `+col+` `+dir, args...)
 		if err != nil {
 			http.Error(w, "db error", http.StatusInternalServerError)
@@ -639,29 +640,44 @@ func listHandler(db *sql.DB) http.HandlerFunc {
 		defer rows.Close()
 
 		type video struct {
-			ID        int64   `json:"id"`
-			Title     string  `json:"title"`
-			Path      string  `json:"path"`
-			Status    string  `json:"status"`
-			Size      int64   `json:"size"`
-			MTime     int64   `json:"mtime"`
-			Duration  float64 `json:"duration"`
-			Width     int     `json:"width"`
-			Height    int     `json:"height"`
-			VCodec    string  `json:"vcodec"`
-			ACodec    string  `json:"acodec"`
-			Native    bool    `json:"native"`
-			CreatedAt string  `json:"created_at"`
+			ID         int64       `json:"id"`
+			Title      string      `json:"title"`
+			Path       string      `json:"path"`
+			Status     string      `json:"status"`
+			Size       int64       `json:"size"`
+			MTime      int64       `json:"mtime"`
+			Duration   float64     `json:"duration"`
+			Width      int         `json:"width"`
+			Height     int         `json:"height"`
+			VCodec     string      `json:"vcodec"`
+			ACodec     string      `json:"acodec"`
+			Native     bool        `json:"native"`
+			Renditions []rendition `json:"renditions"`
+			Kind       string      `json:"kind,omitempty"` // "mp4" = progressive, not HLS
+			CreatedAt  string      `json:"created_at"`
 		}
 		items := []video{}
 		for rows.Next() {
 			var v video
+			var rend string
 			if err := rows.Scan(&v.ID, &v.Path, &v.Status, &v.Size, &v.MTime, &v.Duration, &v.Width, &v.Height,
-				&v.VCodec, &v.ACodec, &v.CreatedAt); err != nil {
+				&v.VCodec, &v.ACodec, &rend, &v.CreatedAt); err != nil {
 				http.Error(w, "db error", http.StatusInternalServerError)
 				return
 			}
 			v.Native = browserNative(v.Path, v.VCodec)
+			v.Renditions = []rendition{}
+			for _, p := range strings.Fields(rend) { // "240:1234 360:5678", or "mp4:1234" (0 = original)
+				h, sz, _ := strings.Cut(p, ":")
+				r := rendition{}
+				if h == "mp4" {
+					v.Kind, r.Height = "mp4", v.Height
+				} else {
+					r.Height, _ = strconv.Atoi(h)
+				}
+				r.Size, _ = strconv.ParseInt(sz, 10, 64)
+				v.Renditions = append(v.Renditions, r)
+			}
 			base := filepath.Base(v.Path)
 			v.Title = strings.TrimSuffix(base, filepath.Ext(base))
 			items = append(items, v)
@@ -707,10 +723,81 @@ func reconcile(db *sql.DB, queue chan<- int64) {
 	}
 }
 
-type encodeOpts struct {
-	height, crf, maxrate, audio int
-	preset                      string
+// moovFirst reports whether an MP4's moov box precedes mdat, i.e. it plays progressively.
+func moovFirst(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	var off int64
+	var h [16]byte
+	for range 64 {
+		if _, err := f.ReadAt(h[:8], off); err != nil {
+			return false
+		}
+		sz := int64(binary.BigEndian.Uint32(h[:4]))
+		switch string(h[4:8]) {
+		case "moov":
+			return true
+		case "mdat":
+			return false
+		}
+		switch sz {
+		case 0:
+			return false // box runs to EOF, no moov seen
+		case 1: // 64-bit size follows the type
+			if _, err := f.ReadAt(h[8:16], off+8); err != nil {
+				return false
+			}
+			sz = int64(binary.BigEndian.Uint64(h[8:16]))
+		}
+		if sz < 8 || off+sz >= fi.Size() {
+			return false
+		}
+		off += sz
+	}
+	return false
 }
+
+// canFastStart: small browser-native H.264 MP4 whose audio also plays; remux beats a transcode.
+func canFastStart(path, vcodec, acodec string, height int) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".mp4", ".m4v":
+	default:
+		return false
+	}
+	return vcodec == "h264" && height > 0 && height <= 360 && (acodec == "" || acodec == "aac" || acodec == "mp3")
+}
+
+type rendition struct {
+	Height int   `json:"height"`
+	Size   int64 `json:"size"` // bytes on disk, playlist + segments
+}
+
+// dirSize sums file sizes under dir.
+func dirSize(dir string) (n int64) {
+	filepath.WalkDir(dir, func(_ string, d fs.DirEntry, _ error) error {
+		if fi, err := d.Info(); err == nil && !d.IsDir() {
+			n += fi.Size()
+		}
+		return nil
+	})
+	return
+}
+
+type encodeOpts struct {
+	crf, audio int
+	preset     string
+}
+
+// ladder is the HLS rendition set, lowest first. Rungs taller than the source are skipped.
+// ponytail: fixed ladder, make it a flag if anyone asks
+var ladder = []struct{ height, maxrate int }{{240, 250}, {360, 500}, {720, 2500}}
 
 func worker(db *sql.DB, servingDir string, opts encodeOpts, queue <-chan int64) {
 	for id := range queue {
@@ -720,7 +807,10 @@ func worker(db *sql.DB, servingDir string, opts encodeOpts, queue <-chan int64) 
 
 func processOne(db *sql.DB, servingDir string, opts encodeOpts, id int64) {
 	var rawPath string
-	if err := db.QueryRow(`SELECT raw_path FROM videos WHERE id = ?`, id).Scan(&rawPath); err != nil {
+	var srcH int
+	var probed bool
+	var vcodec, acodec string
+	if err := db.QueryRow(`SELECT raw_path, height, probed, vcodec, acodec FROM videos WHERE id = ?`, id).Scan(&rawPath, &srcH, &probed, &vcodec, &acodec); err != nil {
 		log.Printf("job %d: lookup failed: %v", id, err)
 		return
 	}
@@ -738,21 +828,58 @@ func processOne(db *sql.DB, servingDir string, opts encodeOpts, id int64) {
 		return
 	}
 
-	args := []string{"-y", "-i", rawPath,
-		"-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-		"-vf", fmt.Sprintf("scale=-2:'min(%d,ih)'", opts.height),
-		"-c:v", "libx264", "-preset", opts.preset, "-crf", strconv.Itoa(opts.crf),
+	if probed && canFastStart(rawPath, vcodec, acodec, srcH) {
+		var n int64 // 0 = moov already first, serve the original
+		if !moovFirst(rawPath) {
+			out := filepath.Join(outDir, "video.mp4")
+			if b, err := exec.Command("ffmpeg", "-y", "-i", rawPath, "-c", "copy", "-movflags", "+faststart", out).CombinedOutput(); err != nil {
+				log.Printf("job %d: faststart failed: %v\n%s", id, err, b)
+				fail(db, id)
+				return
+			}
+			n = dirSize(outDir)
+		}
+		markReady(db, id, fmt.Sprintf("mp4:%d", n))
+		return
 	}
-	if opts.maxrate > 0 {
-		args = append(args, "-maxrate", fmt.Sprintf("%dk", opts.maxrate), "-bufsize", fmt.Sprintf("%dk", opts.maxrate*2))
+	hasAudio := !probed || acodec != "" // unprobed: assume audio
+	rungs := ladder[:1]
+	for _, r := range ladder[1:] {
+		if srcH == 0 || r.height <= srcH {
+			rungs = append(rungs, r)
+		}
+	}
+	args := []string{"-y", "-i", rawPath, "-sn", "-dn"}
+	var vsm, rend []string
+	for i, r := range rungs {
+		n := strconv.Itoa(i)
+		name := fmt.Sprintf("%dp", r.height)
+		if err := os.MkdirAll(filepath.Join(outDir, name), 0755); err != nil {
+			log.Printf("job %d: mkdir failed: %v", id, err)
+			fail(db, id)
+			return
+		}
+		args = append(args, "-map", "0:v:0",
+			"-filter:v:"+n, fmt.Sprintf("scale=-2:'min(%d,ih)'", r.height),
+			"-maxrate:v:"+n, fmt.Sprintf("%dk", r.maxrate), "-bufsize:v:"+n, fmt.Sprintf("%dk", r.maxrate*2))
+		v := "v:" + n
+		if hasAudio {
+			args = append(args, "-map", "0:a:0")
+			v += ",a:" + n
+		}
+		vsm = append(vsm, v+",name:"+name)
+		rend = append(rend, name)
 	}
 	args = append(args,
+		"-c:v", "libx264", "-preset", opts.preset, "-crf", strconv.Itoa(opts.crf),
 		"-profile:v", "main", "-pix_fmt", "yuv420p",
 		"-c:a", "aac", "-b:a", fmt.Sprintf("%dk", opts.audio), "-ac", "2",
-		"-hls_time", "4",
+		"-f", "hls", "-hls_time", "4",
 		"-hls_playlist_type", "vod",
-		"-hls_segment_filename", filepath.Join(outDir, "chunk_%03d.ts"),
-		filepath.Join(outDir, "playlist.m3u8"),
+		"-master_pl_name", "playlist.m3u8",
+		"-var_stream_map", strings.Join(vsm, " "),
+		"-hls_segment_filename", filepath.Join(outDir, "%v", "chunk_%03d.ts"),
+		filepath.Join(outDir, "%v", "index.m3u8"),
 	)
 	cmd := exec.Command("ffmpeg", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -761,7 +888,14 @@ func processOne(db *sql.DB, servingDir string, opts encodeOpts, id int64) {
 		return
 	}
 
-	if _, err := db.Exec(`UPDATE videos SET status = 'ready', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, id); err != nil {
+	for i, name := range rend {
+		rend[i] = fmt.Sprintf("%s:%d", strings.TrimSuffix(name, "p"), dirSize(filepath.Join(outDir, name)))
+	}
+	markReady(db, id, strings.Join(rend, " "))
+}
+
+func markReady(db *sql.DB, id int64, renditions string) {
+	if _, err := db.Exec(`UPDATE videos SET status = 'ready', renditions = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, renditions, id); err != nil {
 		log.Printf("job %d: status update failed: %v", id, err)
 	}
 }

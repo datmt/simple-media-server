@@ -77,6 +77,7 @@
 
   <section id="stage">
     <video id="player" controls></video>
+    <select id="quality" aria-label="Quality" hidden></select>
     <div id="now"><span id="nowTitle"></span><span id="nowKind"></span></div>
   </section>
 
@@ -136,6 +137,8 @@ const dur = s => {
 };
 const date = t => new Date(t * 1000).toLocaleDateString(undefined, {year: 'numeric', month: 'short', day: 'numeric'});
 
+$('quality').onchange = e => hls && (hls.currentLevel = +e.target.value);
+
 let toastTimer;
 function toast(msg) {
   $('toast').textContent = msg;
@@ -147,29 +150,47 @@ function toast(msg) {
 function play(v) {
   playing = v.id;
   if (hls) { hls.destroy(); hls = null; }
+  $('quality').hidden = true;
   const ready = v.status === 'ready';
-  if (ready && Hls.isSupported()) {
+  if (ready && v.kind === 'mp4') {
+    video.src = v.renditions[0].size ? `/stream/${v.id}/video.mp4` : `/api/raw/${v.id}`;
+  } else if (ready && Hls.isSupported()) {
     hls = new Hls();
     hls.loadSource(`/stream/${v.id}/playlist.m3u8`);
     hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      const q = $('quality');
+      q.innerHTML = '<option value="-1">Auto</option>' + hls.levels.map((l, i) => `<option value="${i}">${l.height}p</option>`).join('');
+      q.hidden = hls.levels.length < 2;
+    });
   } else {
     video.src = ready ? `/stream/${v.id}/playlist.m3u8` : `/api/raw/${v.id}`;
   }
   video.poster = `/stream/thumbs/${v.id}.jpg?v=${v.mtime}`;
   video.play().catch(() => toast('Cannot play this file in the browser — optimize it first'));
   $('nowTitle').textContent = v.title;
-  $('nowKind').textContent = `${ready ? 'HLS' : 'Original file'} · ${dur(v.duration)} · ${size(v.size)}`;
+  $('nowKind').textContent = `${ready ? (v.kind === 'mp4' ? 'Fast start' : 'HLS') : 'Original file'} · ${dur(v.duration)} · ${size(v.size)}`;
   $('stage').classList.add('on');
   $('stage').scrollIntoView({behavior: 'smooth', block: 'nearest'});
   render();
 }
+
+const detail = v => {
+  const src = [v.width ? `${v.width}×${v.height}` : '', v.vcodec, v.acodec].filter(Boolean).join(' · ');
+  const opt = v.status !== 'ready' ? '' : v.kind === 'mp4'
+    ? ' → fast start' + (v.renditions[0].size ? ' ' + size(v.renditions[0].size) : ' (original)')
+    : v.renditions.length
+    ? ' → ' + v.renditions.map(r => `${r.height}p ${size(r.size)}`).join(' · ')
+    : ' → HLS (single quality, re-optimize for more)';
+  return esc(src) + opt;
+};
 
 function render() {
   $('rows').innerHTML = items.map(v => `
     <div class="row ${v.id === playing ? 'active' : ''}" data-id="${v.id}">
       <input type="checkbox" ${selected.has(v.id) ? 'checked' : ''} aria-label="Select">
       <img class="thumb" loading="lazy" src="/stream/thumbs/${v.id}.jpg?v=${v.mtime}" alt="" onerror="this.style.visibility='hidden'">
-      <div style="min-width:0"><div class="title">${esc(v.title)}${!v.native && v.status !== 'ready' ? `<span class="warn" title="${esc(v.vcodec)} may not play in browsers">optimize to play</span>` : ''}</div><div class="path">${esc(v.path)}</div><div class="mmeta">${dur(v.duration)} · ${size(v.size)}</div></div>
+      <div style="min-width:0"><div class="title">${esc(v.title)}${!v.native && v.status !== 'ready' ? `<span class="warn" title="${esc(v.vcodec)} may not play in browsers">optimize to play</span>` : ''}</div><div class="path">${esc(v.path)}</div><div class="path">${detail(v)}</div><div class="mmeta">${dur(v.duration)} · ${size(v.size)}</div></div>
       <span class="pill ${v.status}">${label[v.status] || v.status}</span>
       <span class="muted">${dur(v.duration)}</span>
       <span class="muted">${v.height ? v.height + 'p' : '—'}</span>

@@ -39,10 +39,8 @@ Flags (`--library-dir` is required, the rest optional):
 | `--creds-path` | `./creds.json` | basic-auth credentials |
 | `--port` | `8080` | HTTP listen port |
 | `--scan-interval` | `5m` | periodic library rescan (`0` disables); overlapping scans are skipped |
-| `--optimize-height` | `360` | optimized video height in px, never upscaled |
 | `--optimize-crf` | `28` | x264 quality, 18 (best) to 35 (smallest) |
 | `--optimize-preset` | `ultrafast` | x264 speed preset; slower gives smaller files |
-| `--optimize-maxrate` | `500` | video bitrate cap in kbps; `0` = uncapped. Keeps playback smooth on slow links |
 | `--optimize-audio-bitrate` | `64` | audio bitrate in kbps |
 | `--workers` | `2` | concurrent transcode jobs; raise on many-core servers |
 
