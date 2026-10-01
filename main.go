@@ -757,9 +757,9 @@ func listHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		where, args := []string{"1=1"}, []any{}
-		if s := q.Get("q"); s != "" {
+		for _, t := range strings.Fields(q.Get("q")) { // every word must match, any order
 			where = append(where, "filename LIKE ?")
-			args = append(args, "%"+s+"%")
+			args = append(args, "%"+t+"%")
 		}
 		if s := q.Get("status"); s != "" {
 			where = append(where, "status = ?")
